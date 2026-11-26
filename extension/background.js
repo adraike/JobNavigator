@@ -10,24 +10,34 @@ function dashboardHost(serverUrl) {
   try { return new URL(serverUrl || 'http://localhost').hostname.toLowerCase() } catch { return 'localhost' }
 }
 
+let frameRulesQueue = Promise.resolve();
+
 function setupFrameRules() {
-  chrome.storage.sync.get(['serverUrl', 'previewUnblock'], (settings) => {
-    const host = dashboardHost(settings.serverUrl);
-    const DNR = chrome.declarativeNetRequest;
-    // popup toggle "Posting preview": off removes the rules entirely
-    if (settings.previewUnblock === false) {
-      chrome.declarativeNetRequest.updateSessionRules({ removeRuleIds: [1, 2] }, () => console.log('Frame header rules off'));
-      return;
-    }
-    const condition = {
-      urlFilter: "*",
-      resourceTypes: [DNR.ResourceType.SUB_FRAME],
-      initiatorDomains: [host],
-      // never the dashboard's own responses: its cached-page reader is sandboxed by a CSP header
-      excludedRequestDomains: [host],
-    };
-    chrome.declarativeNetRequest.updateSessionRules({ removeRuleIds: [1, 2] }, () => {
-      chrome.declarativeNetRequest.updateSessionRules({
+  frameRulesQueue = frameRulesQueue.then(() => new Promise((resolve) => {
+    chrome.storage.sync.get(['serverUrl', 'previewUnblock'], (settings) => {
+      const host = dashboardHost(settings.serverUrl);
+      const DNR = chrome.declarativeNetRequest;
+      // popup toggle "Posting preview": off removes the rules entirely
+      if (settings.previewUnblock === false) {
+        DNR.updateSessionRules({ removeRuleIds: [1, 2] }, () => {
+          if (chrome.runtime.lastError) {
+            console.error('Failed to remove rules:', chrome.runtime.lastError.message || chrome.runtime.lastError);
+          } else {
+            console.log('Frame header rules off');
+          }
+          resolve();
+        });
+        return;
+      }
+      const condition = {
+        urlFilter: "*",
+        resourceTypes: [DNR.ResourceType.SUB_FRAME],
+        initiatorDomains: [host],
+        // never the dashboard's own responses: its cached-page reader is sandboxed by a CSP header
+        excludedRequestDomains: [host],
+      };
+      DNR.updateSessionRules({
+        removeRuleIds: [1, 2],
         addRules: [
           {
             id: 1,
@@ -56,13 +66,15 @@ function setupFrameRules() {
         ]
       }, () => {
         if (chrome.runtime.lastError) {
-          console.error('Failed to add rules:', chrome.runtime.lastError);
+          console.error('Failed to add rules:', chrome.runtime.lastError.message || chrome.runtime.lastError);
         } else {
           console.log('Frame header rules installed for frames opened by', host);
         }
+        resolve();
       });
     });
-  });
+  }));
+  return frameRulesQueue;
 }
 
 chrome.runtime.onInstalled.addListener(() => {
@@ -104,6 +116,30 @@ function backupToSession() {
   chrome.storage.session.set({ linkedinCapturedIds: Array.from(capturedIds) });
 }
 
+// MT-18 / QA F1: the account every backend call acts for. Chosen (and PIN-checked) in the
+// popup, which stores the signed API token the server issued for it (POST
+// /api/auth/verify-pin) in chrome.storage.local (per browser profile, not synced) next to
+// the id it shows. Nothing stored = no X-Account-Token header (a one-account server then
+// uses its owner, as before). A bare account id is never sent: the server ignores it.
+async function addAccountHeader(headers) {
+  const { accountToken } = await chrome.storage.local.get('accountToken');
+  if (accountToken) headers['X-Account-Token'] = accountToken;
+  return headers;
+}
+
+// 401 invalid_account_token = the account was removed, its PIN changed, or the token
+// expired: forget it; the popup says "pick again".
+async function noteAccountGone(resp) {
+  if (resp.status !== 401) return;
+  try {
+    const d = await resp.clone().json();
+    if (d && d.detail === 'invalid_account_token') {
+      await chrome.storage.local.remove(['accountId', 'accountToken']);
+      await chrome.storage.local.set({ accountRemoved: true });
+    }
+  } catch (_) { /* not JSON */ }
+}
+
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   // only our own popup and content scripts; another extension must not read the persona or push Q&A answers
   if (!sender || sender.id !== chrome.runtime.id) return;
@@ -137,6 +173,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       try {
         const headers = { 'Content-Type': 'application/json' };
         if (apiKey) headers['X-API-Key'] = apiKey;
+        await addAccountHeader(headers);
 
         const resp = await fetch(`${serverUrl}/api/jobs/linkedin-import`, {
           method: 'POST',
@@ -145,6 +182,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         });
 
         if (!resp.ok) {
+          await noteAccountGone(resp);
           sendResponse({ error: `Server error: ${resp.status}` });
           return;
         }
@@ -182,6 +220,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       try {
         const headers = { 'Content-Type': 'application/json' };
         if (apiKey) headers['X-API-Key'] = apiKey;
+        await addAccountHeader(headers);
 
         const resp = await fetch(`${serverUrl}/api/autofill/answer`, {
           method: 'POST',
@@ -195,6 +234,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         });
 
         if (!resp.ok) {
+          await noteAccountGone(resp);
           sendResponse({ error: `Server error: ${resp.status}` });
           return;
         }
@@ -218,6 +258,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       try {
         const headers = { 'Content-Type': 'application/json' };
         if (apiKey) headers['X-API-Key'] = apiKey;
+        await addAccountHeader(headers);
 
         const resp = await fetch(`${serverUrl}/api/persona/qa-bank`, {
           method: 'POST',
@@ -229,6 +270,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         });
 
         if (!resp.ok) {
+          await noteAccountGone(resp);
           sendResponse({ error: `Server error: ${resp.status}` });
           return;
         }
@@ -251,8 +293,10 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       try {
         const headers = {};
         if (apiKey) headers['X-API-Key'] = apiKey;
+        await addAccountHeader(headers);
         const resp = await fetch(`${serverUrl}/api/autofill/config`, { headers });
         if (!resp.ok) {
+          await noteAccountGone(resp);
           sendResponse({ error: `Server error: ${resp.status}` });
           return;
         }
@@ -285,6 +329,7 @@ chrome.runtime.onConnect.addListener((port) => {
       try {
         const headers = { 'Content-Type': 'application/json' };
         if (apiKey) headers['X-API-Key'] = apiKey;
+        await addAccountHeader(headers);
         const resp = await fetch(`${serverUrl}/api/autofill/answer/stream`, {
           method: 'POST',
           headers,
@@ -298,6 +343,7 @@ chrome.runtime.onConnect.addListener((port) => {
           signal: aborter.signal,
         });
         if (!resp.ok || !resp.body) {
+          await noteAccountGone(resp);
           post({ type: 'error', error: `Server error: ${resp.status}` });
           return;
         }

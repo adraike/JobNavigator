@@ -1,11 +1,49 @@
-import React, { useState, useEffect, useMemo, useRef, useCallback } from 'react'
+import React, { useState, useEffect, useMemo, useRef, useCallback, lazy, Suspense } from 'react'
 import ConfirmDialog, { PromptDialog } from '../ConfirmDialog'
 import { useEscape, useSettled, useSingleOpen, NBSP } from '../hooks'
-import { Button, FooterRow, GlyphBadge, Heading, HeaderRow, Helper, IconButton, Input, Label, Link, Menu, MenuHead, MenuItem, ModalPanel, Mono, PageTitle, Pill, Select, Spinner, Surface, Switch, Textarea, ToolbarTrigger } from '../ui'
+import { Button, FooterRow, GlyphBadge, Heading, HeaderRow, Helper, IconButton, Input, Label, Link, Menu, MenuHead, MenuItem, ModalPanel, Mono, PageTitle, Pill, Select, Spinner, Surface, Switch, Textarea, ToolbarTrigger, VisuallyHidden } from '../ui'
 import { useTheme, MODE_OPTIONS, themeOptions } from '../theme'
 import { describeCron, whenShort, CRON_PRESETS } from '../time'
-import api from '../api'
+import api, { authFailure } from '../api'
+import { MAX_ACCOUNTS, useFlushBeforeSwitch } from '../accounts'
+import { PURPOSE, SENT_SUMMARY, TelemetrySettingRow } from '../TelemetryChoice'
+import { UpdateStatusRow } from '../UpdateCheck'
+import { useLocation, useNavigate } from 'react-router-dom'
+import { useToasts, ToastStack } from '../Toast'
+import {
+  AccountsTable, AddAccountModal, YourAccount, accountsChanged, errorText,
+  LockCard, PolicyToggle, ScopeTag, UnlockPill, hhmm, indexSections, rowLocked, scopeTag,
+} from './SettingsAccounts'
 import '../theme.css'
+import RunnerStatus from './RunnerStatus'
+import { loadDemo } from '../demoHooks'
+
+// QA F7 / R6-06: a locked row stays in the accessibility tree (read-only, aria-disabled);
+// its controls are taken out of the tab order and marked read-only, and given back
+// when the row unlocks. `data-jn-tab` remembers a control's own tabindex.
+const LOCKABLE = 'a[href], button, input, select, textarea, [tabindex]'
+function lockControls(el, locked, hard) {
+  el.querySelectorAll(LOCKABLE).forEach((c) => {
+    if (locked) {
+      if (!c.hasAttribute('data-jn-tab')) c.setAttribute('data-jn-tab', c.getAttribute('tabindex') ?? '')
+      c.setAttribute('tabindex', '-1')
+      c.setAttribute('aria-disabled', 'true')
+      if ('readOnly' in c && c.tagName !== 'BUTTON') c.readOnly = true
+      if (hard && 'disabled' in c) c.disabled = true   // the demo: nothing is written
+    } else if (c.hasAttribute('data-jn-tab')) {
+      const t = c.getAttribute('data-jn-tab')
+      if (t === '') c.removeAttribute('tabindex'); else c.setAttribute('tabindex', t)
+      c.removeAttribute('data-jn-tab'); c.removeAttribute('aria-disabled')
+      if ('readOnly' in c && c.tagName !== 'BUTTON') c.readOnly = false
+    }
+  })
+}
+
+// demo build only: the not-affiliated line (dead code, so left out, in the normal build)
+let demoNote
+const getDemoNote = () => (demoNote ||= lazy(() => loadDemo('DemoMarker.jsx').then((m) => ({ default: m.DemoNote }))))
+
+const CAP_TEXT = (n) => `This install already has ${n} accounts — remove one to add another.`
 
 // ── shared bits ──────────────────────────────────────────────────────────────
 const PROVIDERS = [
@@ -13,6 +51,7 @@ const PROVIDERS = [
   ['claude_code', 'Claude Code (Subscription)'],
   ['codex_cli', 'Codex CLI (ChatGPT Subscription)'],
   ['antigravity_cli', 'Antigravity CLI (Google Subscription)'],
+  ['opencode_go', 'OpenCode Go (Subscription)'],
   ['openai', 'OpenAI'],
   ['ollama', 'Ollama (Local)'],
   ['lmstudio', 'LM Studio (Local)'],
@@ -20,9 +59,19 @@ const PROVIDERS = [
 ]
 const PROVIDER_LABEL = Object.fromEntries(PROVIDERS)
 // providers whose catalog /api/llm/models can search live
-const SEARCHABLE = ['openrouter', 'openai', 'claude_api', 'claude_code']
+const SEARCHABLE = ['openrouter', 'openai', 'claude_api', 'claude_code', 'opencode_go']
 // providers that need no key
 const KEYLESS = ['claude_code', 'codex_cli', 'antigravity_cli', 'ollama', 'lmstudio', '']
+// One API key per provider (backend accounts/settings.py PROVIDER_KEY_SETTINGS): every slot on a
+// provider shows and saves the same key, so switching a slot's provider back keeps its key.
+const PROVIDER_KEY = { claude_api: 'anthropic_api_key', openai: 'openai_api_key', openrouter: 'openrouter_api_key', opencode_go: 'opencode_api_key' }
+const keyHelp = (prov, member) => `Saved for ${PROVIDER_LABEL[prov] || prov}: every model slot on it uses this key.`
+  + (member || !PROVIDER_KEY[prov] ? '' : ` Empty uses ${PROVIDER_KEY[prov].toUpperCase()} from .env.`)
+// Provider settings whose value 'claude_code' makes the Claude Code token row relevant.
+const CLAUDE_CODE_SLOTS = ['llm_provider', 'scoring_llm_provider', 'llm_fallback_provider', 'cv_tailor_llm_provider',
+  'cover_letter_llm_provider', 'autofill_llm_provider', 'email_llm_provider']
+const SLOT_NAMES = { llm_provider: 'Primary', scoring_llm_provider: 'Scoring', llm_fallback_provider: 'Scoring fallback', cv_tailor_llm_provider: 'Tailoring',
+  cover_letter_llm_provider: 'Cover letters', autofill_llm_provider: 'Autofill', email_llm_provider: 'Email classification' }
 
 // The value rows' fields are `Input` now (adornment slot and all), so the box
 // lives in ui.jsx with every other field. What is left here is the type these
@@ -168,6 +217,8 @@ export default function Settings() {
   const [defaults, setDefaults] = useState({})
   const [resumes, setResumes] = useState([])
   const [personaAvailable, setPersonaAvailable] = useState(false)
+  const [letterTemplates, setLetterTemplates] = useState([])
+  const [resumeTemplates, setResumeTemplates] = useState([])
   const [query, setQuery] = useState('')
   const [backendVersion, setBackendVersion] = useState('')  // from /health; the colophon notes it only when it differs from this build
   useEffect(() => {
@@ -175,15 +226,17 @@ export default function Settings() {
     fetch('/health').then((r) => r.ok ? r.json() : null).then((h) => { if (on && h?.version) setBackendVersion(String(h.version)) }).catch(() => {})
     return () => { on = false }
   }, [])
-  // Anchor rail highlights where the scroller is parked; opens at the top (Display, the first section).
-  const [active, setActive] = useState('appearance')
+  // Anchor rail highlights where the scroller is parked; null = the top, i.e. the first
+  // section of the page (T7-01: Accounts / Your account when shown, else Display).
+  const [active, setActive] = useState(null)
   const [info, setInfo] = useState(null)      // which row's info panel is open
   const [ovr, setOvr] = useState({})          // which override rows are expanded
   const [trig, setTrig] = useState({})        // action button states
   const [editFor, setEditFor] = useState(null)
   const [modelsOpen, setModelsOpen] = useState(false)
   const [efforts, setEfforts] = useState({})  // provider -> reasoning-effort values, from GET /llm/efforts
-  const [li, setLi] = useState(null)          // linkedin session status
+  const [li, setLi] = useState({})            // {main, mock}: each LinkedIn session's status
+  const [gmail, setGmail] = useState(null)    // MT-19: GET /gmail/status {status, source, configured}
   const [toast, setToast] = useState(null)
   const [loadErr, setLoadErr] = useState(null)   // set on a failed GET /settings
   const [narrow, setNarrow] = useState(false)    // stack rows when the pane is tight
@@ -196,6 +249,105 @@ export default function Settings() {
   const askText = useCallback((spec) => new Promise((resolve) => {
     setDialog({ kind: 'prompt', ...spec, onSubmit: (v) => { setDialog(null); resolve(v) }, onCancel: () => { setDialog(null); resolve(null) } })
   }), [])
+  // ── accounts (MT-13, QA F2 / D2) ──
+  // `me` from /auth/me; `acctData` = GET /accounts. The owner always gets the Accounts
+  // section first (one account: own row + Add account), a member "Your account"; the
+  // role-based parts (policies, locks) need two or more accounts.
+  const [me, setMe] = useState(null)              // { id, name, color, role, has_pin }
+  const [acctCount, setAcctCount] = useState(1)
+  const [acctData, setAcctData] = useState(null)  // { accounts, max_accounts, self_id }
+  const [ownerHasPin, setOwnerHasPin] = useState(true)   // D3: false → a plain Unlock, no PIN pad
+  const [adding, setAdding] = useState(false)
+  // MT-14: settings by role (all of it only with two or more accounts)
+  const [meta, setMeta] = useState(null)           // member: GET /settings `_meta`
+  const [effective, setEffective] = useState({})   // owner: GET /settings `_effective` (local model server addresses in use)
+  const [sidx, setSidx] = useState(null)           // indexSections(GET /settings/sections)
+  const [policies, setPolicies] = useState({})     // owner: {memberId: {section: mode}}
+  const [policyFor, setPolicyFor] = useState('')   // owner: the member whose Inherit/Own controls are shown ('' = hidden)
+  const [unlockedUntil, setUnlockedUntil] = useState(null)   // member: owner unlock end (ms)
+  const { toasts, push, dismiss } = useToasts()
+  const loc = useLocation()
+  const navigate = useNavigate()
+  // R6-10: /auth/me did not answer — nobody is assumed to be the owner
+  const [meErr, setMeErr] = useState(false)
+  const loadAccounts = useCallback(async () => {
+    let data
+    try {
+      ({ data } = await api.get('/auth/me'))
+    } catch (e) {
+      // a 401 raises the picker / sign-in itself; anything else leaves Settings read-only
+      if (!authFailure(e)) setMeErr(true)
+      return
+    }
+    setMeErr(!data?.account)
+    try {
+      if (!data?.account) return
+      const n = Number(data.accounts_count) || 1
+      setMe(data.account); setAcctCount(n); setOwnerHasPin(data.owner_has_pin !== false)
+      const owner = data.account.role === 'owner'
+      if (n < 2) {
+        const r = await api.get('/accounts').catch(() => ({ data: null }))
+        setAcctData(r.data || null)
+        const self = (r.data?.accounts || []).find((a) => a.id === data.account.id)
+        if (self) setMe((m) => ({ ...m, ...self }))
+      }
+      if (n >= 2) {
+        const [r, secs, pols] = await Promise.all([
+          api.get('/accounts'),
+          api.get('/settings/sections').catch(() => ({ data: [] })),
+          owner ? api.get('/settings/policies').catch(() => ({ data: {} })) : Promise.resolve({ data: {} }),
+        ])
+        setAcctData(r.data || null)
+        setSidx(indexSections(secs.data))
+        setPolicies(pols.data || {})
+        const members = (r.data?.accounts || []).filter((a) => a.role !== 'owner')
+        // off until the owner flips a member's "Edit policies" switch in Accounts; never persisted
+        setPolicyFor((cur) => (members.some((m) => m.id === cur) ? cur : ''))
+        const t = Date.parse(data.owner_unlocked_until || '')
+        setUnlockedUntil(Number.isFinite(t) && t > Date.now() ? t : null)
+        const self = (r.data?.accounts || []).find((a) => a.id === data.account.id)
+        if (self) setMe((m) => ({ ...m, ...self }))
+      } else { setSidx(null); setPolicies({}); setPolicyFor(''); setUnlockedUntil(null) }
+    } catch { /* silent: the accounts UI stays hidden, every other row works */ }
+  }, [])
+  useEffect(() => {
+    window.addEventListener('jn:accounts-changed', loadAccounts)
+    return () => window.removeEventListener('jn:accounts-changed', loadAccounts)
+  }, [loadAccounts])
+  const multi = acctCount >= 2 && !!me
+  const hasMe = !!me
+  const isOwner = !!me && me.role === 'owner'
+  const member = multi && !isOwner
+  const ownerName = (acctData?.accounts || []).find((a) => a.role === 'owner')?.name || 'the owner'
+  const unlocked = !!unlockedUntil
+  // the unlock ends on its own after 15 minutes
+  useEffect(() => {
+    if (!unlockedUntil) return undefined
+    const t = setTimeout(() => setUnlockedUntil(null), Math.max(0, unlockedUntil - Date.now()) + 500)
+    return () => clearTimeout(t)
+  }, [unlockedUntil])
+  const onUnlocked = useCallback((until) => {
+    setUnlockedUntil(until)
+    push({ kind: 'success', msg: `Unlocked as ${ownerName} until ${hhmm(until)}` })
+  }, [ownerName, push])
+  const lockOwner = useCallback(async () => {
+    try { await api.post('/auth/owner-lock') } catch { /* the cookie keeps its unlock until it runs out */ }
+    setUnlockedUntil(null)
+    push({ kind: 'success', msg: 'Owner sections locked' })
+  }, [push])
+  const setPolicy = useCallback(async (section, title, mode) => {
+    if (!policyFor) return
+    const who = (acctData?.accounts || []).find((a) => a.id === policyFor)?.name || 'The member'
+    const prev = policies[policyFor]?.[section]
+    setPolicies((p) => ({ ...p, [policyFor]: { ...(p[policyFor] || {}), [section]: mode } }))
+    try {
+      await api.patch('/settings/policies', { account_id: policyFor, section, mode })
+      flash(mode === 'own' ? `${who} keeps their own ${title}` : `${who} inherits your ${title}`)
+    } catch (e) {
+      setPolicies((p) => ({ ...p, [policyFor]: { ...(p[policyFor] || {}), [section]: prev } }))
+      flash(errorText(e, 'Could not change the policy'), true)
+    }
+  }, [policyFor, policies, acctData])  // eslint-disable-line react-hooks/exhaustive-deps
   const scrollRef = useRef(null)
   const timers = useRef([])
   const flashTimer = useRef(null)
@@ -205,7 +357,11 @@ export default function Settings() {
     try {
       const [s, d, e] = await Promise.all([api.get('/settings'), api.get('/settings/defaults').catch(() => ({ data: {} })),
         api.get('/llm/efforts').catch(() => ({ data: {} }))])
-      setS(s.data || {}); setDefaults(d.data || {}); setEfforts(e.data?.efforts || {})
+      // A member's GET /settings carries `_meta` {key: {section, source, editable}} (MT-9);
+      // it is not a setting, so it lives beside the map, never in it. The owner's `_effective` (the LM Studio /
+      // Ollama addresses in use, env or default when the box is empty) likewise.
+      const { _meta: metaMap, _effective: eff, ...values } = s.data || {}
+      setS(values); setMeta(metaMap || null); setEffective(eff || {}); setDefaults(d.data || {}); setEfforts(e.data?.efforts || {})
       // an override row starts open when it actually has a provider or an effort set
       const o = {}
       for (const k of ['scoring_llm', 'llm_fallback', 'cv_tailor_llm', 'cover_letter_llm', 'autofill_llm', 'email_llm']) {
@@ -215,7 +371,7 @@ export default function Settings() {
       setLoadErr(null)
     } catch (e) {
       console.error(e)
-      setLoadErr(e?.response?.data?.detail || e?.message || 'The server did not answer.')
+      setLoadErr(errorText(e, e?.message || 'The server did not answer.'))
     }
   }, [])
 
@@ -250,8 +406,13 @@ export default function Settings() {
     () => load(),
     // This is the Default résumé picker's entire option list — empty, it looks like a setting with nothing to choose.
     () => api.get('/resumes', { params: { is_base: true } }).then(({ data }) => setResumes(data || [])).catch((e) => { console.error(e); flash('Could not load your résumés — the default-résumé picker is empty', true) }),
+    () => api.get('/resumes/templates').then(({ data }) => setResumeTemplates(Array.isArray(data) ? data : [])).catch((e) => { console.error(e); flash('Could not load the résumé templates — the default-template picker is empty', true) }),
+    () => api.get('/cover-letters/templates').then(({ data }) => setLetterTemplates(Array.isArray(data) ? data : [])).catch((e) => { console.error(e); flash('Could not load the cover-letter templates — the default-template picker is empty', true) }),
     () => api.get('/persona').then(({ data }) => setPersonaAvailable(Object.keys(data?.resume_content || {}).length > 0)).catch(() => { /* silent: Persona is one optional entry in that picker */ }),
-    () => api.get('/linkedin/session').then(({ data }) => setLi(data)).catch(() => { /* silent: the LinkedIn row reads “unknown” and its own actions report their failures */ }),
+    () => Promise.all(['main', 'mock'].map((which) => api.get('/linkedin/session', { params: { which } }).then(({ data }) => [which, data])))
+      .then((pairs) => setLi(Object.fromEntries(pairs))).catch(() => { /* silent: the LinkedIn rows read “unknown” and their own actions report their failures */ }),
+    () => loadAccounts(),
+    () => api.get('/gmail/status').then(({ data }) => setGmail(data || null)).catch(() => { /* silent: the Gmail row stays hidden */ }),
   ])
 
   // One shared timer, not one per flash — otherwise two saves inside 2.2s let the first timer clear the second message early.
@@ -282,7 +443,8 @@ export default function Settings() {
       setS((p) => { const n = { ...p }; if (prev === undefined) delete n[key]; else n[key] = prev; return n })
       // Server validates int/cron/enum values and says which key it refused and why — show that instead of a generic failure.
       const detail = e?.response?.status === 400 ? e?.response?.data?.detail : null
-      flash(typeof detail === 'string' && detail ? detail : 'Could not save — try again', true)
+      flash(typeof detail === 'string' && detail ? detail
+        : ([403, 409].includes(e?.response?.status) ? errorText(e, 'Could not save — try again') : 'Could not save — try again'), true)
       return false
     }
   }, [S])
@@ -332,7 +494,8 @@ export default function Settings() {
     } catch (e) {
       console.error(e)
       setTrig((t) => ({ ...t, [id]: '' }))
-      flash(e?.response?.data?.detail || 'Save failed. Try again.', true)
+      // R6-08: codes (owner_only, gmail_not_configured, …) read as sentences
+      flash(errorText(e, 'Save failed. Try again.'), true)
     }
   }
 
@@ -349,24 +512,65 @@ export default function Settings() {
     const voiceOpts = (Array.isArray(vp) ? vp : []).filter((v) => v && v.id).map((v) => [v.id, v.label || v.id])
     const curVoice = S.cover_letter_default_voice
     if (curVoice && !voiceOpts.some((o) => o[0] === curVoice)) voiceOpts.push([curVoice, `${curVoice} — not in presets`])
+    // Default template: the two rules on top, then the templates on this install. A stored id
+    // this install does not have stays visible (letters follow the résumé then).
+    const tplOpts = [['same_as_resume', 'Same as résumé'], ['last_selected', 'Last selected'],
+      ...letterTemplates.map((t) => [t.id, t.name || t.id])]
+    const curTpl = S.cover_letter_template
+    if (curTpl && !tplOpts.some((o) => o[0] === curTpl)) tplOpts.push([curTpl, `${curTpl} — not on this install`])
+    const resTplOpts = [['last_selected', 'Last selected'], ...resumeTemplates.map((t) => [t.id, t.name || t.id])]
+    const curResTpl = S.resume_template
+    if (curResTpl && !resTplOpts.some((o) => o[0] === curResTpl)) resTplOpts.push([curResTpl, `${curResTpl} — not on this install`])
 
+    // QA F2 / D2: the owner's "Accounts" section (one account too) / a member's "Your account" comes first.
+    // Their bodies are not rows (`block`), so they carry no row list and match the search by title.
+    const people = !hasMe ? [] : isOwner
+      ? [['accounts', 'People', 'Accounts', '', [], 'accounts']]
+      : [['account', 'You', 'Your account', '', [], 'account']]
+    // which LLM slots currently run on a given provider (override slots default to empty = follow Primary)
+    const usedBy = (prov) => CLAUDE_CODE_SLOTS.filter((k) => val(k, k === 'llm_provider' ? 'claude_api' : '') === prov).map((k) => SLOT_NAMES[k])
+    // the (i) line that says why a provider row is showing: which model settings below use it
+    const usedLine = (prov) => { const s = usedBy(prov); return s.length ? ` Model settings using ${(PROVIDER_LABEL[prov] || prov).replace(/\s*\(.*\)$/, '')}: ${s.join(', ')}.` : '' }
+    const primaryProv = val('llm_provider', 'claude_api')
     return [
-      // The one group that isn't a DB setting: both rows live in this browser's localStorage (theme.js), so they take no `key` and never PATCH /settings.
+      ...people,
+      // Appearance and Theme live in this browser's localStorage (theme.js): no `key`, never PATCH /settings.
       // They sit first because they change what every screen below looks like.
       ['appearance', 'General', 'Display', '', [
         { kind: 'appearance', label: 'Appearance', help: 'Light, dark, or follow your OS. Saved in this browser.' },
         { kind: 'theme', label: 'Theme', help: 'The app’s look: colours, fonts and shapes. Saved in this browser.' },
-        BT('Classic dashboard', 'Open the previous (v1) interface.', 'Open classic UI', null, { href: '/classic' }),
-      ]],
-      ['feed', '', 'Feed', '', [
+        // a DB setting (feed_zoom_floater, the backend's "feed" section) shown with the look rows
         SW('Zoom control on postings', 'The small + / − floater top-right of a posting.', 'Hidden — postings open at last selected zoom level.', 'feed_zoom_floater',
           { dflt: true, info: 'Zoom is remembered per browser, not per job: set it once and every posting opens at that size. Both the live page and the cached copy are frames, so zoom scales the frame and the page reflows to the new width.' }),
       ]],
       ['models', 'AI', 'Models', '', [
         { kind: 'pair', label: 'Primary provider · model', help: 'Every AI feature uses this pair unless overridden below.',
           pKey: 'llm_provider', mKey: 'llm_model', eKey: 'llm_effort',
-          info: "Providers: Claude API, Claude Code, Codex CLI (your ChatGPT subscription), OpenAI, Ollama (local), LM Studio (local), OpenRouter. The model list shows that provider's models, including any you added under Model catalog. OpenRouter covers every vendor with one key but has no prompt-cache discount. The two subscription CLIs are meant for attended use and have plan limits; a limit hit fails over to the fallback without retrying. Reasoning effort sets how much the model thinks before it answers: higher is slower and costs more. 'default effort' keeps the model's own default. Not every model takes every level; Claude Code steps down to the nearest level, the APIs return an error. Antigravity CLI sets effort in the model name, and Ollama and LM Studio have no effort setting." },
-        B('API key', 'API key for the primary provider.', 'llm_api_key', { secret: true, mono: true, w: '340px', hide: () => KEYLESS.includes(val('llm_provider', 'claude_api')) }),
+          info: "Providers: Claude API, Claude Code, Codex CLI (your ChatGPT subscription), Antigravity CLI (Google subscription), OpenCode Go (subscription), OpenAI, Ollama (local), LM Studio (local), OpenRouter. The model list shows that provider's models, including any you added under Model catalog. OpenRouter covers every vendor with one key but has no prompt-cache discount. The subscription CLIs are meant for attended use and have plan limits; a limit hit fails over to the fallback without retrying. Reasoning effort sets how much the model thinks before it answers: higher is slower and costs more. 'default effort' keeps the model's own default. Not every model takes every level; Claude Code steps down to the nearest level, the APIs return an error. Antigravity CLI sets effort in the model name, and LM Studio has no effort setting. On Ollama, 'default effort' keeps a thinking model from thinking, since on a local GPU it would spend the whole answer on reasoning; any level turns thinking on, which will be a bit slower. Antigravity's -high models can think for 5 minutes on a tailoring or a PDF import; -medium answers in under a minute." },
+        { kind: 'runners', label: 'Provider containers', accountId: me?.id, isOwner,
+          help: 'Codex, Claude Code and Antigravity start automatically after settings are saved.',
+          info: 'Includes all profiles, feature overrides and scoring fallback. Ollama and LM Studio use their configured external addresses.' },
+        B('API key', keyHelp(primaryProv, member), PROVIDER_KEY[primaryProv] || 'anthropic_api_key', { secret: true, mono: true, w: '340px', hide: () => !PROVIDER_KEY[primaryProv] }),
+        // MT-15: the Claude Code login per account. Shown while some slot uses Claude Code, to the owner and to a member whose Models section is its own.
+        B('Claude Code token', member ? 'Your own Claude subscription token.' : 'Empty uses CLAUDE_CODE_OAUTH_TOKEN from .env.',
+          'claude_code_oauth_token', { secret: true, mono: true, w: '340px',
+            info: 'Run claude setup-token once in a terminal signed in to your Claude subscription and paste the token it prints.' + usedLine('claude_code'),
+            hide: () => !usedBy('claude_code').length || (member && sidx?.byId?.models?.mode !== 'own') }),
+        // The other two subscription CLIs keep their login in a folder, not a token: show how to log in.
+        { kind: 'note', label: 'Codex CLI login', help: 'No token to paste: Codex signs in once from a terminal.',
+          info: 'Run the command below once; the login is kept for this account.' + usedLine('codex_cli'),
+          text: 'docker compose exec backend python -m backend.scripts.cli_login codex "<account name>"', hide: () => !usedBy('codex_cli').length },
+        { kind: 'note', label: 'Antigravity CLI login', help: 'No token to paste: Antigravity signs in once from a terminal.',
+          info: 'Run the command below once; the login is kept for this account.' + usedLine('antigravity_cli'),
+          text: 'docker compose exec backend python -m backend.scripts.cli_login agy "<account name>"', hide: () => !usedBy('antigravity_cli').length },
+        // The local model servers' addresses: owner-only settings (one host per install), shown to the owner while some slot uses that provider,
+        // and always with several accounts, since a member's own slots may use it and the owner sets the address (R30 L-10).
+        B('LM Studio address', 'Empty uses LMSTUDIO_BASE_URL from .env.', 'lmstudio_base_url', {
+          info: 'With neither set: http://localhost:1234/v1. The app runs in Docker, so LM Studio on this computer is http://host.docker.internal:1234/v1.' + usedLine('lmstudio'),
+          mono: true, w: '340px', placeholder: effective.lmstudio_base_url, hide: () => member || (!multi && !usedBy('lmstudio').length) }),
+        B('Ollama address', 'Empty uses OLLAMA_BASE_URL from .env.', 'ollama_base_url', {
+          info: 'With neither set: http://localhost:11434. The app runs in Docker, so Ollama on this computer is http://host.docker.internal:11434.' + usedLine('ollama'),
+          mono: true, w: '340px', placeholder: effective.ollama_base_url, hide: () => member || (!multi && !usedBy('ollama').length) }),
         LLM('Scoring', 'Model that scores new jobs against your résumés.', 'scoring_llm'),
         LLM('Scoring fallback', 'Retries scoring once on error or rate limit — scoring only.', 'llm_fallback',
           { info: 'Used only when the scoring call fails or is rate-limited. One retry, then the job stays unscored until the next run. Choose a cheap model from a different provider than the primary.' }),
@@ -375,7 +579,7 @@ export default function Settings() {
         LLM('Autofill', 'Model that answers application-form questions in the extension.', 'autofill_llm'),
         LLM('Email classification', 'Model that sorts Gmail replies into application events.', 'email_llm'),
         { kind: 'models', label: 'Model catalog', help: 'Add new or unlisted models and remove your additions.',
-          info: 'Add models that are not in the built-in list. Search uses the provider’s catalog for OpenRouter, OpenAI and Claude. For Ollama/LM Studio, type the local model name. Removed models stay removed.' },
+          info: 'Add models that are not in the built-in list. Search uses the provider’s catalog for OpenRouter, OpenAI, Claude and OpenCode Go. For Ollama/LM Studio, type the local model name. Removed models stay removed.' },
       ]],
       ['scoring', '', 'Scoring behavior', '', [
         SEL('Default résumé', 'Used when a company has no résumés of its own selected.', 'default_resume_id', resumeOpts, { w: '260px' }),
@@ -391,7 +595,9 @@ export default function Settings() {
         E('Light output schema', 'JSON shape for Light runs.', 'scoring_output_light', { sub: 'CV_NAMES_HERE expands to your résumé names' }),
         E('Full output schema', 'JSON shape for Full runs.', 'scoring_output_full', { sub: 'CV_NAMES_HERE expands to your résumé names' }),
       ]],
-      ['tailoring', '', 'Tailoring', '', [
+      ['tailoring', '', 'Résumé & tailoring', '', [
+        SEL('Default résumé template', 'The template a new résumé starts with.', 'resume_template', resTplOpts, { w: '260px', dflt: 'last_selected',
+          info: 'Last selected: the template you last picked in the résumé editor (yours only, never another account’s). A template: every new résumé gets it. Applies to a blank or imported résumé and one tailored from Persona; a copy tailored from a résumé keeps that résumé’s template. Before any pick, the first template on the list.' }),
         E('Résumé tailoring prompt', 'Default: rewrites only bullets that the job description makes relevant.', 'cv_tailor_prompt', { sub: 'placeholders: {job_description} {resume_json}' }),
         E('Persona tailoring prompt', 'Default: uses the Persona résumé content; falls back to the résumé prompt if empty.', 'persona_tailor_prompt', { sub: 'placeholders: {job_description} {persona_json}' }),
         B('Max parallel tailors', 'Tailoring and cover-letter generation share this limit.', 'tailoring_max_concurrent', { mono: true, int: true, w: '135px' }),
@@ -400,6 +606,8 @@ export default function Settings() {
       ]],
       ['letters', '', 'Cover letters', '', [
         SEL('Default voice', 'The list comes from the voice presets below.', 'cover_letter_default_voice', voiceOpts, { w: '260px' }),
+        SEL('Default template', 'The template a new letter starts with.', 'cover_letter_template', tplOpts, { w: '260px', dflt: 'same_as_resume',
+          info: 'Same as résumé: the letter takes its résumé’s template. Last selected: the template you last picked in the cover-letter editor (yours only, never another account’s). A template: every new letter gets it. When none applies (a blank letter, a letter from Persona, a Modern Professional résumé, nothing picked yet) the letter gets Garamond Modern.' }),
         E('Voice presets', 'One label and prompt per voice. Add more if you want.', 'cover_letter_voice_presets', { json: true, sub: 'JSON — id, label, instruction per voice' }),
         E('Cover letter prompt', 'The generation instruction.', 'cover_letter_prompt', { sub: 'placeholders: {voice_instruction} {length_instruction} {job_description}' }),
       ]],
@@ -416,6 +624,33 @@ export default function Settings() {
             ['posting,notes', 'Posting · notes'], ['resume', 'Résumé only'], ['posting', 'Posting only']], { w: '260px', dflt: 'resume,posting,notes' }),
       ]],
       ['emailclass', '', 'Email classification', '', [
+        // MT-19: each account connects its own mailbox. Shown from two accounts on, and to a
+        // single account that is not already reading the .env mailbox (so the one-account
+        // owner with GMAIL_REFRESH_TOKEN sees today's page unchanged).
+        { kind: 'button', lockKey: 'gmail_refresh_token', label: 'Gmail', help: 'The mailbox the email check reads for replies to your applications.',
+          previewBox: '260px', hide: () => !gmail || !(multi || (gmail.configured && gmail.source !== 'env')),
+          preview: !gmail ? '' : gmail.status === 'expired' ? 'Expired — Google refused the token'
+            : gmail.status === 'connected' ? (gmail.source === 'env' ? 'Connected (from .env)' : 'Connected')
+              : gmail.configured ? 'Not connected' : 'Not set up on this install',
+          btnLabel: gmail?.status === 'connected' && gmail.source === 'account' ? 'Disconnect'
+            : gmail?.status === 'none' ? 'Connect Gmail ↗' : 'Reconnect ↗',
+          info: 'Connecting opens Google’s consent page (read-only access). The token is stored with this account only. The install’s Google OAuth client comes from GMAIL_CLIENT_ID / GMAIL_CLIENT_SECRET in .env.',
+          act: async () => {
+            if (gmail?.status === 'connected' && gmail.source === 'account') {
+              const go = await ask({ title: 'Disconnect Gmail?', body: 'The email check stops reading this mailbox for this account. You can connect again any time.', label: 'Disconnect', danger: true })
+              if (!go) return false
+              const { data } = await api.post('/gmail/disconnect')
+              setGmail(data || null)
+              return true
+            }
+            if (!gmail?.configured) {
+              flash('Gmail is not set up: the owner adds GMAIL_CLIENT_ID and GMAIL_CLIENT_SECRET to .env', true)
+              return false
+            }
+            const { data } = await api.get('/gmail/connect')
+            window.location.assign(data.url)
+            return false
+          } },
         SW('LLM classification', 'Replies are auto-classified into interview / rejection / offer and attached to the right application.', 'Disabled — replies only show as raw snippets.', 'email_llm_enabled'),
         B('Confidence threshold', '0–100 — below this, the email is flagged for manual review instead.', 'email_llm_confidence_threshold', { mono: true, int: true, w: '135px' }),
         E('Classification prompt', 'Labels + confidence + application hint.', 'email_llm_prompt', { sub: 'placeholders: {applications} {from} {subject} {body}' }),
@@ -425,6 +660,8 @@ export default function Settings() {
       ]],
       ['scheduler', 'Pipeline', 'Scheduler', 'intervals in minutes (0 = off) · crons empty = off', [
         B('Scrape all companies', 'Runs every active company scrape on this interval.', 'scrape_interval_minutes', { mono: true, int: true, w: '135px' }),
+        B('Scrapes at once', '1 or 2. Run all, one company, one search and the scheduled scrape wait their turn beyond this.', 'scrape_max_concurrent', { mono: true, int: true, w: '135px',
+          info: 'Each scrape can start its own Chromium, so 1 keeps memory low: a second Run all, from you or another account, waits until the first finishes. A fetch another run made in the last 10 minutes is reused instead of downloaded again.' }),
         B('Email check', 'Polls Gmail for replies to your applications.', 'email_check_interval_minutes', { mono: true, int: true, w: '135px' }),
         B('Cleanup after', 'Days before ignored and skipped job postings are removed.', 'job_archive_after_days', { mono: true, int: true, w: '135px' }),
         B('Auto-reject threshold', 'Days of silence before an application is auto-moved to Rejected.', 'auto_reject_after_days', { mono: true, int: true, w: '135px',
@@ -439,16 +676,42 @@ export default function Settings() {
         E('Body phrases', 'Skip postings whose description contains any of these phrases.', 'body_exclusion_phrases', { list: true, sub: 'one phrase per line · case-insensitive' }),
         E('Title exclude', 'Skip jobs whose title matches any of these words.', 'title_exclude_global', { list: true, sub: 'one phrase per line · case-insensitive' }),
         E('Company exclude', 'Skip jobs from these companies (exact name).', 'company_exclude_global', { list: true, sub: 'one company per line · exact match' }),
+        E('Allowed countries', 'Skip jobs whose known locations are all outside these countries. Jobs with no known location are kept.', 'job_countries_allowed', { list: true, sub: 'one country code per line · e.g. US, GB, DE, CH · empty = all' }),
       ]],
       ['dedup', '', 'Dedup tracking params', '', [
         E('Stripped params', 'Query params removed from job URLs before duplicate detection. All utm_* are always stripped.', 'dedup_tracking_params', { list: true, sub: 'one param per line' }),
       ]],
+      // where each kind of copy of a posting goes (backend posting_links.py); every copy stays
+      // listed on its original under Also listed
+      ['copies', '', 'Copies of a posting', '', [
+        SEL('Same posting, another link', 'The same posting found again under another link, in the same city.', 'dedup_copy_link', [['ignored', 'Ignored — listed under ‘Also listed’'], ['new', 'New — stays in the feed']], { w: '260px', dflt: 'ignored' }),
+        SEL('Same role, another city', 'The same posting or role listed in another city: the same job number, or a word-for-word identical description.', 'dedup_copy_city', [['ignored', 'Ignored — listed under ‘Also listed’'], ['new', 'New — stays in the feed']], { w: '260px', dflt: 'ignored' }),
+        SEL('Same role, new posting', 'The same role posted again under a new id in the same city, with a word-for-word identical description (repost).', 'dedup_copy_repost', [['ignored', 'Ignored — listed under ‘Also listed’'], ['new', 'New — stays in the feed']], { w: '260px', dflt: 'ignored' }),
+      ]],
       ['notifications', 'Integrations', 'Notifications', '', [
         SW('Telegram', 'New high-scoring jobs and the daily digest are sent to your chat. The digest schedule is under Scheduler.', 'Off — no push notifications.', 'telegram_enabled'),
+        // MT-17: a member sends through the household (owner's) bot or a bot of its own; the owner always uses the household bot.
+        SEL('Bot', 'Which Telegram bot sends your alerts and digest.', 'telegram_bot_mode',
+          [['household', 'Use the household bot'], ['own', 'Use my own bot']], { w: '260px', dflt: 'household', hide: () => !member,
+            info: 'The household bot is the one the owner set up. Your own bot comes from @BotFather; its token stays in your account. System alerts (scrape health) always go to the owner.' }),
+        B('Bot token', 'Your bot’s token from @BotFather.', 'telegram_bot_token',
+          { secret: true, mono: true, w: '340px', hide: () => !member || val('telegram_bot_mode', 'household') !== 'own' }),
+        // From two accounts on: link the chat with a one-time code instead of looking up the chat id by hand.
+        { kind: 'button', lockKey: 'telegram_chat_id', label: 'Link Telegram', help: 'Links your Telegram chat to this account with a one-time code.',
+          btnLabel: val('telegram_chat_id') ? 'Relink…' : 'Link…', previewBox: '260px', hide: () => !multi,
+          preview: val('telegram_chat_id') ? `Linked · chat ${val('telegram_chat_id')}` : 'Not linked',
+          act: async () => {
+            const { data } = await api.post('/telegram/link-code')
+            const bot = data.bot === 'own' ? 'your own bot' : 'the household bot'
+            await askText({ title: 'Link Telegram',
+              body: `Send this to ${bot} in Telegram within 10 minutes (the number alone works too). The bot answers “Linked to ${data.account}”.`,
+              value: `/start ${data.code}`, readOnly: true, mono: true, label: 'Done' })
+            load()
+          } },
         B('Chat ID', 'Your Telegram chat — get it by messaging @userinfobot.', 'telegram_chat_id', { mono: true, w: '135px' }),
         B('Score threshold', 'Only jobs scoring at or above this trigger an instant alert.', 'fit_score_threshold', { mono: true, int: true, w: '135px' }),
-        BT('Test', 'Confirms the bot token and chat ID work end to end.', 'Send test message', () => api.post('/telegram/test')),
-        { kind: 'button', label: 'Webhook secret', help: 'Optional. Checks every call from Telegram to the backend. Alerts and the digest work without it.',
+        BT('Test', 'Confirms the bot token and chat ID work end to end.', 'Send test message', () => api.post('/telegram/test'), { lockKey: 'telegram_chat_id' }),
+        { kind: 'button', lockKey: 'telegram_webhook_secret', label: 'Webhook secret', help: 'Optional. Checks every call from Telegram to the backend. Alerts and the digest work without it.',
           btnLabel: 'Rotate', previewBox: '260px',
           preview: S.telegram_webhook_secret === MASK ? 'Set (hidden — rotate to view)' : (S.telegram_webhook_secret ? 'Set' : 'Not set'),
           info: 'Telegram sends this secret with every webhook call. Calls with the wrong secret are rejected. After rotating, the new secret is shown once: copy it, then register the webhook again.',
@@ -459,14 +722,20 @@ export default function Settings() {
             await askText({ title: 'New webhook secret', body: 'Copy it now — it is not shown again.', value: data.webhook_secret || '', readOnly: true, mono: true, label: 'Done' })
             load()
           } },
-        BT('Register webhook', 'Points Telegram at your public URL so inbound bot commands reach the backend.', 'Register…', async () => {
+        BT('Register webhook', member && val('telegram_bot_mode', 'household') === 'own'
+          ? 'Points your own bot at the public URL so its buttons and link codes reach the backend.'
+          : 'Points Telegram at your public URL so inbound bot commands reach the backend.', 'Register…', async () => {
+          // R6-08: own bot without a token has nothing to register (the server says owner_only)
+          if (member && val('telegram_bot_mode', 'household') === 'own' && !val('telegram_bot_token')) {
+            flash('Add your bot token above first — then register its webhook.', true); return false
+          }
           const url = await askText({ title: 'Register the Telegram webhook', body: 'The public base URL Telegram should post updates to.', placeholder: 'https://your-domain.example', mono: true, label: 'Register' })
           if (!url || !url.trim()) return false
           const { data } = await api.post('/telegram/register-webhook', { public_url: url.trim() })
           // local failures carry `error`, Telegram's own carry `description`
           const failed = data?.ok === false
           flash(failed ? (data.description || data.error || 'Registration failed') : 'Webhook registered', failed)
-        }),
+        }, { lockKey: member && val('telegram_bot_mode', 'household') === 'own' ? 'telegram_bot_token' : 'telegram_webhook_secret' }),
       ]],
       ['tracer', '', 'Tracked links', '', [
         SW('Rewrite links', 'Résumé and letter links become short links on your domain that record when a recruiter opens them.', 'Off — documents keep their original links.', 'tracer_links_enabled',
@@ -475,6 +744,15 @@ export default function Settings() {
         SEL('URL style', 'Your domain must support the selected link style.', 'tracer_links_url_style',
           [['path', 'Path + random (/cv/a7x2kp)'], ['param', 'Param + random (?cv=a7x2kp)'],
             ['path_jobid', 'Path + job ID (/cv/142li)'], ['param_jobid', 'Param + job ID (?cv=142li)']], { w: '260px', dflt: 'path' }),
+      ]],
+      ['apify', '', 'Apify', '', [
+        B('Apify API key', 'Used by Apify searches. Apify bills this account for each result.', 'apify_api_key',
+          { secret: true, mono: true, w: '340px', placeholder: 'apify_api_…',
+            info: 'Copy the token from console.apify.com › Settings › API & Integrations. It is stored in your database and is never sent back to the browser. The Apify Creator plan cannot run Store actors, so every board fails on it: use the Free plan or a paid plan. Each account has its own key; a member who inherits this section runs on the owner’s key, and the owner’s Apify account pays.' }),
+        BT('Key check', 'Confirms the key and that its Apify plan can run Store actors. Runs no search.', 'Check key', async () => {
+          const { data } = await api.post('/settings/apify/check')
+          flash(data.inherited ? 'Key works — the owner’s Apify key, shared with you' : `Key works — Apify account ${data.username}`)
+        }),
       ]],
       ['jobright', '', 'Jobright.ai', '', [
         B('Email', 'Your Jobright account.', 'jobright_email', { w: '260px' }),
@@ -486,29 +764,95 @@ export default function Settings() {
             info: 'Jobright hands out a 60-day cookie. The scraper stores it, reuses it across restarts and renews it on its own when it expires or is rejected; nothing here needs doing unless you want to force a fresh sign-in.' }),
       ]],
       ['linkedin', '', 'LinkedIn', '', [
-        B('Personal email', 'Used by LinkedIn Personal collections.', 'linkedin_email', { w: '260px' }),
-        B('Personal password', 'Stored locally.', 'linkedin_password', { secret: true, w: '260px' }),
-        { kind: 'linkedin', label: 'Session cookie', help: 'The extension import reuses a signed-in session. LinkedIn asks for an emailed PIN at login.' },
-        SW('Use a mock account', 'The session signs in with the mock account below.', 'Off — the session signs in with the personal account above.', 'linkedin_use_mock_account',
-          { dflt: !!val('linkedin_mock_email'), info: 'Optional. The extension captures jobs while you browse LinkedIn collections. A separate account keeps rate limits, CAPTCHAs or bans off your real profile.' }),
-        ...(isOn('linkedin_use_mock_account', !!val('linkedin_mock_email')) ? [
-          B('Mock account email', 'The extension browses specific jobs with this mock account.', 'linkedin_mock_email', { w: '260px' }),
-          B('Mock account password', 'Stored locally only.', 'linkedin_mock_password', { secret: true, w: '260px' }),
-        ] : []),
+        // Two sessions, each signed in on its own (no switch): the main account for LinkedIn
+        // Personal, the mock account for the extension import and the employer-link lookup.
+        B('Main account email', 'Your own LinkedIn account. LinkedIn Personal searches use it.', 'linkedin_email', { w: '260px' }),
+        B('Main account password', 'Stored locally.', 'linkedin_password', { secret: true, w: '260px' }),
+        { kind: 'linkedin', which: 'main', lockKey: 'linkedin_email', label: 'Main session', help: 'Signed in with the main account. LinkedIn emails a PIN at sign-in.' },
+        B('Mock account email', 'A separate account for the extension import and the employer-link lookup.', 'linkedin_mock_email',
+          { w: '260px', info: 'Optional. Keeps rate limits, CAPTCHAs or bans off your real profile. Without a mock account the extension import uses the main session, and the employer-link lookup stays off: it never uses your own account.' }),
+        B('Mock account password', 'Stored locally only.', 'linkedin_mock_password', { secret: true, w: '260px' }),
+        { kind: 'linkedin', which: 'mock', lockKey: 'linkedin_email', label: 'Mock session', help: 'Signed in with the mock account. The extension import uses it, and after every scrape it finds the direct apply link.' },
       ]],
       ['advanced', 'System', 'Advanced', '', [
         B('Proxy URL', 'Used by scrapes that hit rate limits or geo-blocks. Empty = direct.', 'proxy_url', { mono: true, w: '340px', placeholder: 'socks5://127.0.0.1:9050' }),
         { kind: 'apikey', label: 'Dashboard API key', help: 'Saving refreshes the session cookie so iframes keep working.' },
-        BT('DB backup', 'DB snapshot now, outside the cron.', 'Run backup', () => api.post('/db/backup')),
+        BT('DB backup', 'DB snapshot now, outside the cron.', 'Run backup', () => api.post('/db/backup'), { ownerOnly: true }),
+      ]],
+      ['updates', '', 'Updates', '', [
+        SEL('Check for updates', 'Compares this install with GitHub. It only reports; it never updates the install.', 'update_check_mode',
+          [['off', 'Off'], ['release', 'New releases'], ['commit', 'New commits on main']], { w: '260px', dflt: 'off',
+            info: 'New releases compares the version with the latest GitHub release. New commits on main compares the commit of this clone with the head of main; the backend reads it from the clone’s .git, which docker-compose.yml mounts read-only. Only api.github.com is called, without a token and without data about this install. To update: git pull && docker compose pull && docker compose up -d. Commits on main have no prebuilt images, so after git pull build them with docker compose up --build -d.' }),
+        B('Repository', 'The GitHub repository to compare with, as owner/name. Empty = vesaias/JobNavigator.', 'update_check_repo', { mono: true, w: '260px', placeholder: 'vesaias/JobNavigator' }),
+        { kind: 'updates', label: 'Status', help: 'The last result. GitHub is asked at most every 6 hours.' },
+      ]],
+      ['telemetry', '', 'Telemetry', '', [
+        { kind: 'telemetry', label: 'Allow anonymous telemetry', help: PURPOSE,
+          info: SENT_SUMMARY },
       ]],
     ]
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [S, resumes, personaAvailable, trig, li])
+  }, [S, resumes, personaAvailable, letterTemplates, resumeTemplates, trig, li, multi, isOwner, hasMe, sidx, gmail, effective])
+
+  // The rail's account menu lands here: `#accounts` (Manage accounts) scrolls to the
+  // Accounts / Your account section, `#add-account` also opens the Add dialog. The hash is
+  // consumed so the same menu item works again on the next click.
+  const hasS = !!S
+  useEffect(() => {
+    const h = loc.hash.replace('#', '')
+    if (!ready || !hasS || (h !== 'accounts' && h !== 'add-account')) return
+    const target = isOwner ? 'accounts' : 'account'
+    setActive(target)
+    requestAnimationFrame(() => {
+      const c = scrollRef.current
+      const el = c && c.querySelector(`[data-sec="sec-${target}"]`)
+      if (c && el) c.scrollTop += el.getBoundingClientRect().top - c.getBoundingClientRect().top - 4
+    })
+    // R6-11: at the cap the Add dialog would only end in 409 account_limit
+    const cap = acctData?.max_accounts || MAX_ACCOUNTS
+    if (h === 'add-account' && isOwner) {
+      if ((acctData?.accounts || []).length >= cap) push({ kind: 'error', msg: CAP_TEXT(cap) })
+      else setAdding(true)
+    }
+    navigate(loc.pathname + loc.search, { replace: true })
+  }, [loc.hash, ready, hasS, multi, isOwner])  // eslint-disable-line react-hooks/exhaustive-deps
+
+  // MT-19: Google's consent comes back to /settings?gmail=connected|error&reason=…#gmail.
+  useEffect(() => {
+    const p = new URLSearchParams(loc.search)
+    const g = p.get('gmail')
+    if (!ready || !hasS || !g) return
+    const reason = p.get('reason') || 'error'
+    if (g === 'connected') push({ kind: 'success', msg: 'Gmail connected' })
+    // QA F8 / R5-06: the consent must finish in the browser (and account) that pressed Connect Gmail
+    else if (reason === 'browser_mismatch' || reason === 'account_mismatch') push({ kind: 'error', msg: 'Gmail was not connected — finish the Google consent in the same browser and account that pressed Connect Gmail' })
+    else push({ kind: 'error', msg: `Gmail was not connected (${reason}) — try Connect Gmail again` })
+    setActive('emailclass')
+    requestAnimationFrame(() => {
+      const c = scrollRef.current
+      const el = c && c.querySelector('[data-sec="sec-emailclass"]')
+      if (c && el) c.scrollTop += el.getBoundingClientRect().top - c.getBoundingClientRect().top - 4
+    })
+    navigate(loc.pathname, { replace: true })
+  }, [loc.search, ready, hasS])  // eslint-disable-line react-hooks/exhaustive-deps
+
+  const created = (acc) => {
+    setAdding(false)
+    push({ kind: 'success', msg: `Added ${acc?.name || 'the account'} — switch to it from the rail` })
+    accountsChanged()
+  }
 
   const q = query.trim().toLowerCase()
-  const matches = (sec) => !q || sec[2].toLowerCase().includes(q) ||
+  const matches =(sec) => !q || sec[2].toLowerCase().includes(q) ||
     sec[4].some((r) => `${r.label} ${r.help || ''}`.toLowerCase().includes(q))
-  const visible = sections.filter(matches)
+  // Everyone sees the page's own order; each section's tag says whose it is (Yours, Inherited from
+  // <owner>, Owner only) and locked ones are dimmed (MT-14's member regrouping is gone).
+  const ordered = sections
+  // T7-01: at the top (nothing jumped to yet) the first section of the page is the current one
+  const cur = (active && ordered.some((s) => s[0] === active)) ? active : ordered[0]?.[0]
+  const lockCtx = { member, unlocked, meta, idx: sidx }
+  const sectionLocked = (rows) => rows.some((r) => !(r.hide && r.hide()) && rowLocked(r, lockCtx))
+  const visible = ordered.filter(matches)
 
   // Hoisted so the LOADING frame paints the same chrome the settled one does —
   // this screen used to render a bare centred div, so on a slow link it was
@@ -519,11 +863,18 @@ export default function Settings() {
       <div style={{ display: 'flex', flexDirection: 'column', gap: 3, minWidth: 0 }}>
         <PageTitle>Settings</PageTitle>
         <span style={{ fontSize: 13, lineHeight: '20px', color: toast?.bad ? 'var(--bad)' : (toast ? 'var(--accent)' : 'var(--muted)'), whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis', transition: 'color .15s' }}>
-          {toast ? toast.msg : (ready ? 'Saves automatically · everything stays on this machine' : NBSP)}
+          {toast ? toast.msg : (ready ? (member ? `Your settings save automatically · shared settings are ${ownerName}’s` : 'Saves automatically · everything stays on this machine') : NBSP)}
         </span>
       </div>
+      {/* MT-14: a member's lock pill. The owner sets member policies from Settings › Accounts
+          (each member row's "Edit policies" switch), not from here. */}
+      {ready && member && (
+        <span style={{ marginLeft: 'auto', display: 'flex', alignItems: 'center', height: 32 }}>
+          <UnlockPill ownerName={ownerName} unlockedUntil={unlockedUntil} onUnlocked={onUnlocked} onLock={lockOwner} ownerHasPin={ownerHasPin} />
+        </span>
+      )}
       {/* ui: keep — settings search field wrapper (Input role), not a pill; h32 tracks ui.jsx's boxed SearchInput */}
-      <div className="v2-fieldwrap" style={{ marginLeft: 'auto', flex: '0 0 auto', height: 32, width: 230, padding: '0 12px', border: '1px solid var(--edge)', background: 'var(--surface)', borderRadius: 'var(--radius-control)', display: 'flex', alignItems: 'center', gap: 7 }}>
+      <div className="v2-fieldwrap" style={{ marginLeft: ready && member ? 0 : 'auto', flex: '0 0 auto', height: 32, width: 230, padding: '0 12px', border: '1px solid var(--edge)', background: 'var(--surface)', borderRadius: 'var(--radius-control)', display: 'flex', alignItems: 'center', gap: 7 }}>
         {/* ui: keep — the field's search glyph (an icon adornment), not a helper sub-line; Helper's 11.5 would grow the glyph */}
         <span style={{ flex: '0 0 auto', fontSize: 11, color: 'var(--muted)' }}>⌕</span>
         <input value={query} onChange={(e) => setQuery(e.target.value)} placeholder="Search settings…"
@@ -565,14 +916,16 @@ export default function Settings() {
       <div style={{ flex: 1, display: 'flex', minHeight: 0 }}>
         {/* anchor rail */}
         <div className="v2-scroll" style={{ flex: '0 0 216px', borderRight: '1px solid var(--line)', overflow: 'auto', padding: '16px 0 20px' }}>
-          {sections.map(([id, group, title]) => (
+          {ordered.map(([id, group, title, , rows]) => (
             <div key={id} style={{ display: 'flex', flexDirection: 'column' }}>
               {group && <Label style={{ padding: '14px 26px 6px 30px' }}>{group}</Label>}
               {/* ui: keep — a nav row, not an inline link: h29 with a selected state (accent border-left, 600 weight) */}
               <div onClick={() => jump(id)} {...kb(() => jump(id), 'link')} aria-label={`Jump to ${title}`} className="v2-anchor" style={{ display: 'flex', alignItems: 'center', height: 29, padding: '0 26px 0 29px', fontSize: 12.5, cursor: 'pointer',
-                color: active === id && !q ? 'var(--text)' : 'var(--text-2)', fontWeight: active === id && !q ? 600 : 400,
+                // MT-14: a member's locked sections read dimmed in the nav
+                ...(member && sectionLocked(rows) ? { opacity: 0.55 } : null),
+                color: cur === id && !q ? 'var(--text)' : 'var(--text-2)', fontWeight: cur === id && !q ? 600 : 400,
                 /* 3px accent border + 29px left pad keeps the label position consistent whether or not the border shows */
-                borderLeft: `3px solid ${active === id && !q ? 'var(--accent)' : 'transparent'}` }}>{title}</div>
+                borderLeft: `3px solid ${cur === id && !q ? 'var(--accent)' : 'transparent'}` }}>{title}{member && sectionLocked(rows) && <VisuallyHidden> (locked)</VisuallyHidden>}</div>
             </div>
           ))}
         </div>
@@ -580,7 +933,13 @@ export default function Settings() {
         {/* rows */}
         <div ref={attachScroller} className="v2-scroll" style={{ flex: 1, minWidth: 0, overflow: 'auto', padding: '0 40px 40px', minHeight: 0 }}>
           <div style={{ display: 'flex', flexDirection: 'column', maxWidth: 980 }}>
-            {visible.map(([id, , title, sub, rows]) => (
+            {meErr && (
+              <div role="alert" data-account-error style={{ display: 'flex', alignItems: 'center', gap: 10, paddingTop: 22 }}>
+                <span style={{ fontSize: 13, lineHeight: '20px', color: 'var(--bad)' }}>Couldn’t check which account this is — settings are read-only until it loads.</span>
+                <Link onClick={() => loadAccounts()}>Try again</Link>
+              </div>
+            )}
+            {visible.map(([id, , title, sub, rows, block]) => (
               <div key={id} style={{ display: 'flex', flexDirection: 'column' }}>
                 {/* alignItems center, not baseline: both children are 26px tall (shared line-height below), so centring matches baseline in the default theme
                     but avoids baseline's font-dependent offset union, which grew the head 56→59px under the alt theme. */}
@@ -591,10 +950,46 @@ export default function Settings() {
                   <Heading strong size={19}>{title}</Heading>
                   {/* ui: keep — the 26px line-height is the alignment (see above): Helper's 16px would drop this off the grid */}
                   <span style={{ fontSize: 11.5, lineHeight: '26px', color: 'var(--muted)', minWidth: 0, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{sub}</span>
+                  {/* MT-14 (two or more accounts only): the section's scope, or the owner's Inherit / Own control */}
+                  {multi && !block && (() => {
+                    const sec = sidx?.byId?.[id]
+                    if (isOwner && sec?.scope === 'policy') {
+                      if (!policyFor) return null
+                      const name = (acctData?.accounts || []).find((a) => a.id === policyFor)?.name || 'Member'
+                      return <PolicyToggle memberName={name} sectionTitle={title}
+                        mode={policies[policyFor]?.[id] || sec.default} onChange={(m) => setPolicy(id, title, m)} />
+                    }
+                    // "Per device" only while the owner edits a member's policies
+                    if (id === 'appearance' && !(isOwner && policyFor)) return null
+                    const tag = scopeTag(id, { idx: sidx, member, ownerName })
+                    return tag ? <span data-scope-tag={tag.label} style={{ marginLeft: 'auto', display: 'flex' }}><ScopeTag tag={tag} /></span> : null
+                  })()}
                 </div>
-                {rows.filter((r) => !(r.hide && r.hide())).map((r) => (
-                  <Row key={r.label} r={r} ctx={{ S, val, isOn, save, info, setInfo, ovr, setOvr, trig, runAction, setEditFor, setModelsOpen, modelsFor, effortsFor, li, setLi, flash, defaults, narrow }} />
-                ))}
+                {block === 'accounts' && <AccountsTable data={acctData} me={me} onAdd={() => setAdding(true)} onChanged={accountsChanged} push={push}
+                  {...(multi && isOwner && sidx ? { policyFor, onPolicyFor: setPolicyFor, policies, idx: sidx } : null)} />}
+                {block === 'account' && <YourAccount data={acctData} me={me} onChanged={accountsChanged} push={push} />}
+                {rows.filter((r) => !(r.hide && r.hide())).map((r0) => {
+                  // QA F5 (R6-02): the owner's addresses and secrets reach a member only as
+                  // `_meta.set_by_owner` (the value is blanked); the row says so, read-only.
+                  const r = member && r0.key && meta?.[r0.key]?.set_by_owner ? { ...r0, kind: 'ownerset', ownerName } : r0
+                  const row = <Row key={r.label} r={r} ctx={{ S, val, isOn, save, info, setInfo, ovr, setOvr, trig, runAction, setEditFor, setModelsOpen, modelsFor, effortsFor, li, setLi, flash, defaults, narrow }} />
+                  const demo = !!S._demo && id !== 'appearance'   // the demo build's read-only settings; Display stays live (the demo answers the zoom switch's write itself)
+                  if (!member && !meErr && !demo) return row
+                  // MT-14: a row the member cannot edit shows its (owner's) value, dimmed and
+                  // read-only. R6-06: not `inert` — that hid the value from screen readers; the
+                  // row is aria-disabled and its controls leave the tab order instead.
+                  // R6-10: with no answer from /auth/me every row is read-only.
+                  const locked = meErr || demo || rowLocked(r, lockCtx)
+                  return (
+                    <div key={r.label} data-locked={locked ? 'true' : undefined} aria-disabled={locked || undefined}
+                      ref={(el) => { if (el) lockControls(el, locked, demo) }}
+                      style={locked ? { opacity: 0.55, pointerEvents: 'none' } : undefined}>{row}</div>
+                  )
+                })}
+                {member && !block && sectionLocked(rows) && (
+                  <LockCard ownerName={ownerName} sectionTitle={title} onUnlocked={onUnlocked} ownerHasPin={ownerHasPin}
+                    inherited={sidx?.byId?.[id]?.scope === 'policy' && sidx?.byId?.[id]?.mode === 'inherit'} />
+                )}
               </div>
             ))}
             {visible.length === 0 && (
@@ -620,6 +1015,7 @@ export default function Settings() {
                   style={{ color: 'var(--muted)', fontSize: 'inherit', lineHeight: 'inherit', fontWeight: 400, textDecoration: 'none' }}>viktoresadze.com ↗</Link>
               </span>
             </Helper>
+            {__DEMO__ && <Suspense fallback={null}>{React.createElement(getDemoNote())}</Suspense>}
           </div>
         </div>
       </div>
@@ -627,6 +1023,10 @@ export default function Settings() {
       {editFor && <EditModal spec={editFor} S={S} defaults={defaults} onSave={save} onClose={() => setEditFor(null)} />}
       {modelsOpen && <ModelsModal S={S} save={save} onClose={() => setModelsOpen(false)} />}
       {dialog && (dialog.kind === 'prompt' ? <PromptDialog {...dialog} /> : <ConfirmDialog {...dialog} />)}
+      {adding && me && (
+        <AddAccountModal accounts={acctData?.accounts || [me]} onClose={() => setAdding(false)} onCreated={created} />
+      )}
+      {toasts.length > 0 && <ToastStack toasts={toasts} onClose={dismiss} />}
     </div>
   )
 }
@@ -684,9 +1084,9 @@ function Row({ r, ctx }) {
             {on && <Select value={p} options={PROVIDERS} onPick={(v) => pickProvider(`${r.base}_provider`, `${r.base}_effort`, v)} width="200px" placeholder="pick provider…" ariaLabel={`${r.label} — provider`} />}
             {on && <Select value={val(`${r.base}_model`)} options={modelsFor(p || primary)} onPick={(v) => save(`${r.base}_model`, v)} width="260px" mono placeholder="pick model…" ariaLabel={`${r.label} — model`} emptyText={NO_MODELS} />}
             {on && eff.length > 0 && <Select value={val(`${r.base}_effort`)} options={effortOptions(eff, effortEmpty)} onPick={(v) => save(`${r.base}_effort`, v)} width="150px" ariaLabel={`${r.label} — reasoning effort`} />}
-            {on && p && !KEYLESS.includes(p) && (
-              <span title="API key for this override's provider" style={{ display: 'flex', flex: '0 1 150px', minWidth: 0 }}>
-                <TextBox value={val(`${r.base}_api_key`)} onSave={(v) => save(`${r.base}_api_key`, v)} width="150px" mono secret ariaLabel={`${r.label} — API key`} />
+            {on && p && PROVIDER_KEY[p] && (
+              <span title={`API key for ${PROVIDER_LABEL[p] || p}, shared by every model slot on it`} style={{ display: 'flex', flex: '0 1 150px', minWidth: 0 }}>
+                <TextBox value={val(PROVIDER_KEY[p])} onSave={(v) => save(PROVIDER_KEY[p], v)} width="150px" mono secret ariaLabel={`${r.label} — API key`} />
               </span>
             )}
             {/* ui: keep — a Tag: uppercase on a --surface-2 r99 chip, not a Label */}
@@ -699,6 +1099,7 @@ function Row({ r, ctx }) {
                 if (!next) {
                   // `ovr` is local state the PATCHes don't own — if any clear fails, reopen the row or it reads
                   // "inherits Primary" while the server still holds an override.
+                  // The key stays: it is the provider's, shared by every slot on it.
                   const a = await save(`${r.base}_provider`, '')
                   const b = a && await save(`${r.base}_model`, '')
                   const c = b && await save(`${r.base}_effort`, '')
@@ -743,15 +1144,19 @@ function Row({ r, ctx }) {
                   <Helper mono style={{ minWidth: 0, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{r.preview}</Helper>
                 </span>
               : <Helper size="xs" mono style={{ flex: 1, minWidth: 0, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{r.preview}</Helper>)}
-            {/* A row that just navigates (Classic dashboard) carries an `href` instead of an
-                `act` — a real <a> via Button, not the running/done ActionBtn pill. */}
-            {r.href
-              ? <Pill onClick={() => { window.location.assign(r.href) }} ariaLabel={`${r.label} — ${r.btnLabel}`}>{r.btnLabel}</Pill>
-              : <ActionBtn label={r.btnLabel} state={trig[r.label] || ''} onClick={() => runAction(r.label, r.act)} ariaLabel={`${r.label} — ${r.btnLabel}`} />}
+            <ActionBtn label={r.btnLabel} state={trig[r.label] || ''} onClick={() => runAction(r.label, r.act)} ariaLabel={`${r.label} — ${r.btnLabel}`} />
           </>
         )
+      case 'note':
+        return <Mono style={{ fontSize: 11.5, userSelect: 'all', overflowWrap: 'anywhere' }}>{r.text}</Mono>
+      case 'runners':
+        return <RunnerStatus accountId={r.accountId} isOwner={r.isOwner} />
       case 'apikey':
         return <ApiKeyRow value={val('dashboard_api_key')} save={save} flash={flash} />
+      case 'telemetry':
+        return <TelemetrySettingRow />
+      case 'updates':
+        return <UpdateStatusRow mode={val('update_check_mode', 'off')} repo={val('update_check_repo')} />
       case 'readonly': {
         const set = !!val(r.key)
         if (!set) return <Helper style={{ flex: 1, minWidth: 0 }}>{r.emptyText || 'Not set'}</Helper>
@@ -782,8 +1187,10 @@ function Row({ r, ctx }) {
           </>
         )
       }
+      case 'ownerset':
+        return <Helper style={{ flex: 1, minWidth: 0 }}>Set by {r.ownerName}</Helper>
       case 'linkedin':
-        return <LinkedInRow li={li} setLi={setLi} flash={flash} />
+        return <LinkedInRow which={r.which} li={li[r.which]} setLi={(data) => setLi((prev) => ({ ...prev, [r.which]: data }))} flash={flash} />
       default:
         return null
     }
@@ -873,23 +1280,23 @@ function ApiKeyRow({ value, save, flash }) {
   )
 }
 
-function LinkedInRow({ li, setLi, flash }) {
+function LinkedInRow({ which, li, setLi, flash }) {
   const [pin, setPin] = useState('')
   const poll = useRef(null)
   useEffect(() => () => clearInterval(poll.current), [])
 
   const start = async () => {
     try {
-      await api.post('/linkedin/session/refresh')
+      await api.post('/linkedin/session/refresh', null, { params: { which } })
       clearInterval(poll.current)
       poll.current = setInterval(async () => {
         try {
-          const { data } = await api.get('/linkedin/session')
+          const { data } = await api.get('/linkedin/session', { params: { which } })
           setLi(data)
           if (!['running', 'awaiting_pin'].includes(data.phase)) clearInterval(poll.current)
         } catch { /* keep polling */ }
       }, 2500)
-    } catch (e) { flash(e?.response?.data?.detail || 'Could not start the refresh', true) }
+    } catch (e) { flash(errorText(e, 'Could not start the refresh'), true) }
   }
 
   const phase = li?.phase || 'idle'
@@ -902,7 +1309,7 @@ function LinkedInRow({ li, setLi, flash }) {
         {phase === 'awaiting_pin' ? (li?.detail || 'LinkedIn emailed a PIN.')
           : phase === 'running' ? (li?.detail || 'Signing in…')
             : phase === 'failed' && li?.detail ? li.detail
-            : (li?.summary || 'Unknown')}
+            : (li?.signed_in_as ? `${li.signed_in_as} · ` : '') + (li?.summary || 'Unknown')}
       </Helper>
       {phase === 'awaiting_pin' && (
         <>
@@ -910,14 +1317,14 @@ function LinkedInRow({ li, setLi, flash }) {
             ariaLabel="LinkedIn sign-in PIN" mono style={{ ...MONO_FIELD, flex: '0 1 120px' }} />
           <ActionBtn label="Submit PIN" state="" onClick={async () => {
             try {
-              const { data } = await api.post('/linkedin/session/pin', { pin })
+              const { data } = await api.post('/linkedin/session/pin', { pin }, { params: { which } })
               if (!data.ok) flash(data.detail || 'Enter the digits from the email', true)
               else { setPin(''); flash('PIN sent') }
-            } catch (e) { flash(e?.response?.data?.detail || 'Could not send the PIN', true) }
+            } catch (e) { flash(errorText(e, 'Could not send the PIN'), true) }
           }} />
         </>
       )}
-      {phase !== 'awaiting_pin' && <ActionBtn label="Refresh cookie" state={busy ? 'running' : ''} onClick={start} />}
+      {phase !== 'awaiting_pin' && <ActionBtn label={li?.exists ? 'Refresh session' : 'Sign in'} state={busy ? 'running' : ''} onClick={start} />}
     </>
   )
 }
@@ -970,6 +1377,8 @@ function EditModal({ spec, S, defaults, onSave, onClose }) {
   const flushRef = useRef(flush)
   closeRef.current = close
   flushRef.current = flush
+  // QA F7 / R6-01: an account switch (shortcut) writes the pending text first
+  useFlushBeforeSwitch(() => flushRef.current())
   useEffect(() => {
     const onKey = (e) => { if (e.key === 'Escape') closeRef.current() }
     document.addEventListener('keydown', onKey)
@@ -1019,7 +1428,7 @@ function ModelsModal({ S, save, onClose }) {
     setLoading(true); setErr('')
     api.get('/llm/models', { params: { provider } })
       .then(({ data }) => { if (!dead) setLive(Array.isArray(data) ? data : (data?.models || [])) })
-      .catch((e) => { if (!dead) setErr(e?.response?.data?.detail || 'Could not reach the catalog') })
+      .catch((e) => { if (!dead) setErr(errorText(e, 'Could not reach the catalog')) })
       .finally(() => { if (!dead) setLoading(false) })
     return () => { dead = true }
   }, [provider])

@@ -10,8 +10,12 @@ import httpx
 
 from sqlalchemy.exc import IntegrityError
 
-from backend.models.db import SessionLocal, Job, Search, Setting, get_existing_external_ids
+from backend.models.db import SessionLocal, Job, Search, get_existing_external_ids
+from backend.accounts.settings import get_setting, set_setting
 from backend.scraper._shared.dedup import make_external_id, make_content_hash
+from backend.scraper._shared.posting_links import counts_as_new
+from backend.scraper._shared.postings import resolve_short_links
+from backend.scraper._shared.filters import include_hit
 
 logger = logging.getLogger("jobnavigator.jobright")
 
@@ -32,16 +36,11 @@ RETRY_BACKOFF = [15, 45, 90]  # seconds to wait on each retry
 
 
 def _get_setting(db, key, default=""):
-    row = db.query(Setting).filter(Setting.key == key).first()
-    return row.value if row else default
+    return get_setting(db, key, default)
 
 
 def _save_setting(db, key, value):
-    row = db.query(Setting).filter(Setting.key == key).first()
-    if row:
-        row.value = value
-    else:
-        db.add(Setting(key=key, value=value))
+    set_setting(db, key, value)
     db.commit()
 
 
@@ -107,7 +106,10 @@ async def _ensure_session(force_relogin: bool = False) -> str:
         email = _get_setting(db, "jobright_email")
         password = _get_setting(db, "jobright_password")
         if not email or not password:
-            raise RuntimeError("Jobright credentials not configured (set jobright_email and jobright_password in Settings)")
+            # T7-11 / QA F5: a member on its own Jobright section with nothing set reads ""
+            # here (never the owner's credentials), so its copied search fails with this.
+            raise RuntimeError("Jobright is not set up for this account: set your Jobright "
+                               "email and password in Settings › Jobright.ai")
 
         session_id = await _login(email, password)
 
@@ -189,6 +191,11 @@ async def _fetch_search_ssr(keyword: str, location: str = "") -> tuple[list[dict
 def _parse_salary(salary_desc: str) -> tuple:
     """Parse salary string like '$120K - $180K/yr' into (min, max) integers."""
     if not salary_desc:
+        return None, None
+    # "$45/hr" or "$8K/mo" is not a yearly figure (the bare-number rule below would read
+    # $45 as $45K); the text stays in salary_text.
+    from backend.analyzer.salary_extractor import is_non_annual
+    if is_non_annual(salary_desc):
         return None, None
 
     # Match patterns like $120K, $120,000, $120000
@@ -369,7 +376,7 @@ async def run(search: Search) -> dict:
         kept_jobs = []
         for j in unique_jobs:
             title_lower = j["title"].lower()
-            if include_kw and not any(kw.lower() in title_lower for kw in include_kw):
+            if include_kw and not any(include_hit(kw, title_lower) for kw in include_kw):
                 continue
             if exclude_kw and any(re.search(r'\b' + re.escape(kw) + r'\b', title_lower) for kw in exclude_kw):
                 continue
@@ -414,6 +421,20 @@ async def run(search: Search) -> dict:
         try:
             existing_ids = get_existing_external_ids(db)
 
+            # The loop below writes rows; H-1B lookups for the new jobs happen before it (S2-01).
+            from backend.scraper._shared.analysis import prefetch_h1b
+            await prefetch_h1b([j["company"] for j in kept_jobs
+                                if make_external_id(j["company"], j["title"], j["url"]) not in existing_ids])
+
+            landed = await resolve_short_links([j["url"] for j in kept_jobs])
+            # Jobright's description is its own AI summary: new jobs get the employer's text
+            # from their own link, so copies of one role can be proven (employer_text.py).
+            from backend.scraper._shared.employer_text import employer_descriptions
+            fresh = [j for j in kept_jobs
+                     if make_external_id(j["company"], j["title"], j["url"]) not in existing_ids]
+            swapped = await employer_descriptions(fresh, landed)
+            if swapped:
+                logger.info(f"Jobright: employer description for {swapped}/{len(fresh)} new jobs")
             for j in kept_jobs:
                 job_url = j["url"]
                 ext_id = make_external_id(j["company"], j["title"], job_url)
@@ -434,6 +455,7 @@ async def run(search: Search) -> dict:
                     company=j["company"],
                     title=j["title"],
                     url=job_url,
+                    apply_url=landed.get(job_url),
                     source="jobright",
                     search_id=search.id,
                     location=j.get("location") or None,
@@ -469,14 +491,14 @@ async def run(search: Search) -> dict:
 
                 if job.h1b_jd_flag:
                     _phrase = getattr(job, "_h1b_matched_phrase", None) or "?"
-                    logger.info(f"Skipping job (body exclusion): {j['title']} @ {j.get('company', '?')} — matched phrase: {_phrase!r}")
+                    logger.info(f"Skipping job (body exclusion): {j['title']} @ {job.company or j.get('company') or '?'} — matched phrase: {_phrase!r}")
                     continue
 
                 try:
                     with db.begin_nested():
                         db.add(job)
                         db.flush()
-                    new_jobs += 1
+                    new_jobs += counts_as_new(job)
                     existing_ids.add(ext_id)
                 except IntegrityError:
                     logger.debug(f"Duplicate external_id for '{j['title']}' at {j.get('company')}, skipping")
@@ -610,11 +632,11 @@ async def preview(search, db) -> dict:
         all_exclude = list(global_exclude_set | search_exclude_set)
 
         # Body exclusion phrases (H-1B + language)
-        body_row = db.query(Setting).filter(Setting.key == "body_exclusion_phrases").first()
+        body_raw = get_setting(db, "body_exclusion_phrases")
         body_phrases = []
-        if body_row and body_row.value:
+        if body_raw:
             try:
-                body_phrases = json.loads(body_row.value)
+                body_phrases = json.loads(body_raw)
             except json.JSONDecodeError:
                 pass
 
@@ -631,7 +653,7 @@ async def preview(search, db) -> dict:
             reason = None
 
             # Title filters
-            if include_kw and not any(kw.lower() in title_lower for kw in include_kw):
+            if include_kw and not any(include_hit(kw, title_lower) for kw in include_kw):
                 kept = False
                 reason = f"No match for: {', '.join(include_kw)}"
             if kept and exclude_kw:

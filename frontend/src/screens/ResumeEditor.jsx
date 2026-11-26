@@ -1,17 +1,23 @@
 import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react'
+import ClosedMark from '../ClosedMark'
 import { useParams, useNavigate } from 'react-router-dom'
 import api from '../api'
+import { track } from '../telemetry'
+import { useFlushBeforeSwitch } from '../accounts'
 import '../theme.css'
 import { useToasts, ToastStack } from '../Toast'
 import ConfirmDialog from '../ConfirmDialog'
+import { downloadErrorReason, downloadName } from '../download'
 import { useEscape, useSingleOpen, setFlashToast, fetchRunOutcome, runFailed, runFailureReason, useSettled, NBSP } from '../hooks'
 import { useTitle } from '../useTitle'
+import { loadDemo } from '../demoHooks'
 // The résumé-content editors are shared with /persona (a Persona's
 // resume_content is the same shape as a Resume's json_data).
 import {
-  EMPTY, SECTION_ORDER, sectionCounts, makeMutators,
+  EMPTY, resumeSectionNames, sectionCounts, makeMutators,
   SectionShell, SectionEditor, BandRule,
 } from './ResumeSections'
+import ResumeName from './ResumeName'
 import { Band, Button, Check, ChoiceCard, ChoiceModal, ChoiceRow, FooterRow, Heading, HeaderRow, Helper, IconButton, Input, Label, Menu, MenuHead, MenuItem, ModalPanel, Mono, NavLink, Pill, Rule, ScoreRing, Spinner, Surface, Textarea, ToolbarTrigger } from '../ui'
 
 // contiguous prefix/suffix word diff → { before, removed, added, after }
@@ -96,6 +102,7 @@ export default function ResumeEditor() {
   const [baseCopyCount, setBaseCopyCount] = useState(null)
   const [scoring, setScoring] = useState(false)
   const [headMenu, setHeadMenu] = useState(false)
+  const [renaming, setRenaming] = useState(false)   // the top-bar name is an input
   const [confirm, setConfirm] = useState(null)   // v2 dialog, not window.confirm
   const [jobErr, setJobErr] = useState(false)   // the linked job failed to load
   const [parentName, setParentName] = useState(null)   // the base this copy came from
@@ -159,6 +166,7 @@ export default function ResumeEditor() {
     setTailorOpen(false)
     try {
       const { data: started } = await api.post('/resumes/tailor', { base_resume_id: baseId, job_id: jobId || undefined, job_description: jobDescription || undefined })
+      track('tailor_started', { from: jobId ? 'job' : 'pasted' })
       // the run_id lets the watcher read the run's real status
       pendingRef.current.push({ scope: `${baseId}:${jobId || 'freeform'}`, runId: started?.run_id || null, jobId: jobId || null, company: company || null, since: Date.now() })
       pushToast({ kind: 'progress', msg: company ? `Tailoring for ${company}… runs in the background.` : 'Tailoring from a pasted description… runs in the background.' })
@@ -179,6 +187,7 @@ export default function ResumeEditor() {
         pushToast({ kind: 'success', msg: `Copy created for ${company}.`, action: 'Open ↗', onAction: () => navigate(`/resumes/${data.id}`) })
       } else {
         const { data: started } = await api.post('/resumes/tailor', { base_resume_id: baseId, job_id: doc.job_id })
+        track('tailor_started', { from: 'job' })
         pendingRef.current.push({ scope: `${baseId}:${doc.job_id}`, runId: started?.run_id || null, jobId: doc.job_id, company, since: Date.now() })
         pushToast({ kind: 'progress', msg: `Tailoring for ${company}… runs in the background.` })
       }
@@ -309,6 +318,7 @@ export default function ResumeEditor() {
     const scope = doc.job_id ? `${doc.job_id}:resume:${id}` : `resume:${id}`
     try {
       const { data: started } = await api.post(`/resumes/${id}/score-check`, { depth })
+      track('score_run', { depth })
       const runId = started?.run_id || null   // identifies the run below
       pushToast({ kind: 'progress', msg: `Scoring (${depth}) — runs in the background.` })
       const t0 = Date.now()
@@ -367,6 +377,21 @@ export default function ResumeEditor() {
     })
   }, [doc, id, navigate, pushToast])
 
+  // Saves on its own (not through the debounced persist): `persist` keeps one pending patch,
+  // so a rename sent through it would replace an unsaved json_data edit.
+  // Both setDoc calls check the id: the request can end after the user opens another résumé.
+  const rename = useCallback(async (value) => {
+    setRenaming(false)
+    const next = (value || '').trim()
+    if (!next || next === doc.name) return
+    const mine = String(doc.id), prev = doc.name
+    const setName = (n) => setDoc((d) => (d && String(d.id) === mine ? { ...d, name: n } : d))
+    setName(next)
+    try { await api.patch(`/resumes/${mine}`, { name: next }); setSavedAt(new Date().toISOString()) }
+    catch (e) { setName(prev); pushToast({ kind: 'error', msg: `Rename failed — ${e.response?.data?.detail || e.message || 'try again'}.` }) }
+  }, [doc, pushToast])
+  const startRename = () => { setHeadMenu(false); setRenaming(true) }
+
   const goCover = () => { setHeadMenu(false); navigate(`/cover-letters?resume=${id}${doc.job_id ? `&job=${doc.job_id}` : ''}`) }
 
   // the "one next step" stage for a tailored copy: Score is offered only when there's
@@ -383,15 +408,27 @@ export default function ResumeEditor() {
   }, [isCopy, doc, freeformJd, changes.length, reviewed, scores.tailored, scoring, coverExists, jobData, runScore, markApplied]) // eslint-disable-line
 
   // debounced persist
+  // QA F7 / R6-01: the patch the timer still owes, so a switch can send it first
+  const pendingSave = useRef(null)
+  const sendSave = useCallback(async (patch) => {
+    try { await api.patch(`/resumes/${id}`, patch); setSavedAt(new Date().toISOString()) }
+    catch (e) { console.error(e); setSavedAt(null); pushToast({ kind: 'error', msg: `Save failed — your last edit is not stored. ${e.response?.data?.detail || e.message || ''}`.trim() }) }
+    setSaving(false)
+  }, [id])  // eslint-disable-line react-hooks/exhaustive-deps
   const persist = useCallback((patch) => {
     setSaving(true)
     clearTimeout(saveTimer.current)
-    saveTimer.current = setTimeout(async () => {
-      try { await api.patch(`/resumes/${id}`, patch); setSavedAt(new Date().toISOString()) }
-      catch (e) { console.error(e); setSavedAt(null); pushToast({ kind: 'error', msg: `Save failed — your last edit is not stored. ${e.response?.data?.detail || e.message || ''}`.trim() }) }
-      setSaving(false)
-    }, 500)
-  }, [id])
+    pendingSave.current = patch
+    saveTimer.current = setTimeout(() => { pendingSave.current = null; sendSave(patch) }, 500)
+  }, [sendSave])
+  // Sends the patch the timer still owes now (a switch, a download); undefined when none.
+  const flushSave = useCallback(() => {
+    const patch = pendingSave.current
+    if (!patch) return undefined
+    clearTimeout(saveTimer.current); pendingSave.current = null
+    return sendSave(patch)
+  }, [sendSave])
+  useFlushBeforeSwitch(flushSave)
   const onData = useCallback((next) => { setData(next); persist({ json_data: next }) }, [persist])
   const pickTemplate = (t) => { setTemplate(t); setTplOpen(false); persist({ template: t }) }
   const pickFormat = (f) => { setFormat(f); setFmtOpen(false); persist({ page_format: f }) }
@@ -407,7 +444,7 @@ export default function ResumeEditor() {
       const ac = new AbortController(); pdfAbort.current = ac
       try {
         const r = await api.get(`/resumes/${id}/pdf`, { responseType: 'arraybuffer', params: { template, format }, signal: ac.signal })
-        const url = URL.createObjectURL(new Blob([r.data], { type: 'application/pdf' }))
+        const url = URL.createObjectURL(new Blob([r.data], { type: __DEMO__ ? 'text/html' : 'application/pdf' }))
         setPdfUrl((prev) => { if (prev) URL.revokeObjectURL(prev); return url })
         setPdfErr(false)
       } catch (e) {
@@ -456,11 +493,6 @@ export default function ResumeEditor() {
     return n
   })
 
-  const pdfDownloadUrl = useMemo(() => {
-    const base = (api.defaults.baseURL || '').replace(/\/api$/, '')
-    return `${base}/api/resumes/${id}/pdf?template=${encodeURIComponent(template)}&format=${encodeURIComponent(format)}`
-  }, [id, template, format])
-
   // Reserves the chrome's shape while the document loads, instead of a bare "Loading…"
   // that collapses the screen then jumps to the real layout once the doc lands.
   if (!doc || !data) {
@@ -478,6 +510,7 @@ export default function ResumeEditor() {
   }
 
   const counts = sectionCounts(data)
+  const sectionNames = resumeSectionNames(doc)
   const tplLabel = templates.find((t) => t.id === template)?.name || template || 'Template'
 
   return (
@@ -488,8 +521,7 @@ export default function ResumeEditor() {
         <span style={{ color: 'var(--line)' }}>|</span>
         {/* ui: keep — Tag-role uppercase badge (bg + r99, not a Label); case/tracking read --label-case/--label-tracking-scale so an alt skin can turn both off */}
         <span style={{ fontSize: 9.5, letterSpacing: 'calc(.08em * var(--label-tracking-scale))', textTransform: 'var(--label-case)', padding: '2px 7px', borderRadius: 'var(--radius-control)', background: isCopy ? 'var(--ai-soft)' : 'var(--surface-2)', color: isCopy ? 'var(--ai)' : 'var(--muted)' }}>{isCopy ? 'tailored' : 'base'}</span>
-        {/* every other v2 screen names itself with an h1; visually identical to the old span (margin/font reset inline) */}
-        <h1 title={doc.name} style={{ margin: 0, fontFamily: 'var(--font-body)', fontSize: 14, lineHeight: '20px', fontWeight: 600, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis', maxWidth: 460 }}>{doc.name}</h1>
+        <ResumeName name={doc.name} editing={renaming} onEdit={() => setRenaming(true)} onDone={rename} />
         <Helper style={{ marginLeft: 'auto' }}>{saving ? 'Saving…' : savedAt ? `saved ${timeAgo(savedAt)} · autosaves` : 'autosaves'}</Helper>
       </HeaderRow>
 
@@ -505,7 +537,7 @@ export default function ResumeEditor() {
             <div style={{ fontSize: 12.5, fontWeight: 500, color: 'var(--text-2)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis', minWidth: 0, lineHeight: '18px' }}>
               {!ctxReady ? NBSP : <>
               {jobData?.company
-                ? <>Tailored for <span style={{ color: 'var(--text)' }}>{jobData.company}{jobData.title ? ` — ${jobData.title}` : ''}</span></>
+                ? <>Tailored for <span style={{ color: 'var(--text)' }}>{jobData.company}{jobData.title ? ` — ${jobData.title}` : ''}</span><ClosedMark jobId={doc.job_id} /></>
                 : (jobless && freeformJd ? 'Tailored from a pasted description' : 'Tailored copy')}
               {doc.parent_id && (() => {
                 // A freeform copy has no "→" to split on, so the name heuristic returns the
@@ -553,6 +585,7 @@ export default function ResumeEditor() {
                   <MenuItem icon="◎" hint="score only" onClick={() => runScore('light')}>Score again · light</MenuItem>
                   <MenuItem icon="◎" hint="with report" onClick={() => runScore('full')}>Score again · full</MenuItem>
                   {changes.length > 0 && <MenuItem icon="≋" hint={`${changes.length} to review`} onClick={() => { setHeadMenu(false); setReviewOpen(true) }}>Review changes</MenuItem>}
+                  <MenuItem icon="✎" onClick={startRename}>Rename</MenuItem>
                   <Rule style={{ margin: '4px 8px' }} />
                   <MenuHead>Job</MenuHead>
                   {/* `hint` slots deliberately empty: they read as single-letter
@@ -587,6 +620,7 @@ export default function ResumeEditor() {
                 <Menu ariaLabel="Résumé actions" style={{ position: 'absolute', top: '100%', right: 0, marginTop: 5, zIndex: 45, width: 244 }}>
                   <MenuHead>This base</MenuHead>
                   <MenuItem icon="✦" hint="adds a copy" onClick={() => { setHeadMenu(false); setTailorOpen(true) }}>Tailor for a job…</MenuItem>
+                  <MenuItem icon="✎" onClick={startRename}>Rename</MenuItem>
                   <MenuItem danger icon="✕" onClick={deleteResume}>Delete résumé</MenuItem>
                 </Menu>
               </>
@@ -599,7 +633,7 @@ export default function ResumeEditor() {
       <div style={{ flex: 1, display: 'flex', minHeight: 0 }}>
         {/* left: sections */}
         <section className="v2-scroll" style={{ flex: '0 0 47%', borderRight: '1px solid var(--line)', overflow: 'auto', padding: '14px 20px 24px', display: 'flex', flexDirection: 'column', gap: 10 }}>
-          {SECTION_ORDER.map((name) => (
+          {sectionNames.map((name) => (
             <SectionShell key={name} name={name} count={counts[name]} open={open.has(name)} onToggle={() => toggle(name)}
               meta={changedSections.has(name) ? <span title="Contains unreviewed tailoring changes" style={{ marginLeft: 'auto', fontSize: 10, color: 'var(--warn)' }}>● changed by tailoring</span> : null}>
               <SectionEditor name={name} data={data} setField={setField} mutate={mutate} baseData={baseData} onError={(msg) => pushToast({ kind: 'error', msg })}
@@ -635,11 +669,7 @@ export default function ResumeEditor() {
                   </Menu>
               )}
             </div>}
-            {/* round 9: `Button href` renders the real download anchor, on the
-                primary paint this toolbar drew by hand (--accent / --accent-ink /
-                500). Overrides restore the toolbar's own 29px height and 12px label. */}
-            <Button size="sm" href={pdfDownloadUrl} target="_blank"
-              style={{ marginLeft: 'auto', minWidth: 0, height: 29, gap: 6, fontSize: 12 }}>↓ Download PDF</Button>
+            <DownloadMenu id={id} template={template} format={format} beforeDownload={flushSave} onError={(msg) => pushToast({ kind: 'error', msg })} />
           </HeaderRow>
           <Surface radius="none" style={{ flex: 1, minHeight: 0, position: 'relative' }}>
             {pdfUrl && <iframe title="pdf" src={`${pdfUrl}#view=FitH`} style={{ width: '100%', height: '100%', border: 'none' }} />}
@@ -660,6 +690,54 @@ export default function ResumeEditor() {
       {confirm && <ConfirmDialog {...confirm} onCancel={() => setConfirm(null)} />}
 
       <ToastStack toasts={toasts} onClose={dismissToast} />
+    </div>
+  )
+}
+
+// ── Download (PDF / Word) ────────────────────────────────────────────────────
+// The preview toolbar's Download button and its menu; the Word export is based on work by
+// @mrAlishah. Each choice goes through axios and saves the blob, like the cover-letter
+// download, so the X-API-Key header travels and a failed export is an error toast rather
+// than a JSON page in a new tab. The current template and paper ride along, so a fresh
+// pick that the debounced save hasn't stored yet is still what downloads. `beforeDownload`
+// sends an edit the debounced save still owes, so the file has the last keystroke (R30 D-06).
+export function DownloadMenu({ id, template, format, onError, beforeDownload }) {
+  const [open, setOpen] = useState(false)
+  const [busy, setBusy] = useState(false)
+  useEscape(() => setOpen(false), open)
+  const download = async (kind) => {
+    setOpen(false); setBusy(true)
+    try {
+      await beforeDownload?.()
+      const r = await api.get(`/resumes/${id}/${kind}`, { responseType: 'blob', params: { template, format } })
+      track('resume_exported', { format: kind, template })
+      if (__DEMO__ && kind === 'pdf') {   // the demo prints the rendered template through the browser
+        const { printHtml, blobText } = await loadDemo('pdf.js')
+        await printHtml(await blobText(r.data)); return
+      }
+      const url = URL.createObjectURL(r.data)
+      const a = document.createElement('a')
+      a.href = url; a.download = downloadName(r.headers?.['content-disposition'], `Resume.${kind}`)
+      document.body.appendChild(a); a.click(); a.remove()
+      setTimeout(() => URL.revokeObjectURL(url), 1000)
+    } catch (e) {
+      console.error(e)
+      const reason = await downloadErrorReason(e)
+      onError?.((kind === 'docx' ? 'Could not download the Word document' : 'Could not download the PDF') + (reason ? ` — ${reason}` : '.'))
+    } finally { setBusy(false) }
+  }
+  // Overrides keep the toolbar's own 29px height and 12px label.
+  return (
+    <div style={{ position: 'relative', flex: '0 0 auto', marginLeft: 'auto' }}>
+      <Button size="sm" busy={busy} ariaHaspopup="menu" ariaExpanded={open} onClick={() => setOpen((v) => !v)}
+        style={{ minWidth: 0, height: 29, gap: 6, fontSize: 12 }}>↓ Download</Button>
+      {open && (
+        <Menu ariaLabel="Download résumé" onDismiss={() => setOpen(false)}
+          style={{ position: 'absolute', top: '100%', right: 0, marginTop: 5, zIndex: 45, width: 168 }}>
+          <MenuItem hint=".pdf" hintMono onClick={() => download('pdf')}>PDF</MenuItem>
+          <MenuItem hint=".docx" hintMono onClick={() => download('docx')}>Word</MenuItem>
+        </Menu>
+      )}
     </div>
   )
 }

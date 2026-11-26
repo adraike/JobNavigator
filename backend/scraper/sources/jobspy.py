@@ -4,15 +4,18 @@ import json
 import logging
 import re
 import time
-from contextlib import contextmanager
 from datetime import datetime, timezone
 
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from backend.countries import DEFAULT_COUNTRY, compose_location
-from backend.models.db import SessionLocal, Search, Job, Setting, get_existing_external_ids
+from backend.models.db import SessionLocal, Search, Job, get_existing_external_ids
+from backend.accounts.settings import get_setting
 from backend.scraper._shared.dedup import make_external_id, make_content_hash
+from backend.scraper._shared.posting_links import counts_as_new, employer_link
+from backend.scraper._shared.postings import is_short_link, resolve_short_link
+from backend.scraper._shared.filters import include_pattern
 
 logger = logging.getLogger("jobnavigator.scraper.sources.jobspy")
 
@@ -27,6 +30,19 @@ def _clean(v):
         pass  # non-scalar (list/array) — fall through and stringify
     s = str(v).strip()
     return s or None
+
+
+def _jobspy_yearly(interval, *amounts) -> bool:
+    """True when a JobSpy row's pay may be stored as a yearly salary: its interval is yearly or
+    unstated, and each amount given is at least 1000 (JobSpy runs without enforce_annual_salary,
+    so an hourly row carries the hourly figure). Not annualised, as no source does that."""
+    unit = (_clean(interval) or "yearly").lower()
+    if unit not in ("yearly", "annual", "year"):
+        return False
+    try:
+        return all(float(a) >= 1000 for a in amounts if _clean(a) is not None)
+    except (TypeError, ValueError):
+        return False
 
 
 def _apply_h1b_inline(job, db=None, company_lookup=None, phrases=None, loop=None) -> None:
@@ -47,45 +63,8 @@ def _apply_h1b_inline(job, db=None, company_lookup=None, phrases=None, loop=None
         logger.warning(f"_apply_h1b_inline failed for job {getattr(job, 'id', '?')}: {e}")
 
 
-# jobspy swallows per-board failures into its own loggers instead of the return
-# value, so a hard-failed board looks identical to one that found nothing; capture those records here.
-
-_JOBSPY_SITE_KEYS = {
-    "linkedin": "linkedin",
-    "indeed": "indeed",
-    "ziprecruiter": "zip_recruiter",
-    "google": "google",
-    "glassdoor": "glassdoor",
-    "bayt": "bayt",
-    "naukri": "naukri",
-    "bdjobs": "bdjobs",
-}
-
-
-# jobspy logs each board under two spellings (e.g. "LinkedIn" vs "Linkedin"); _site_key()
-# lowercases both to the same key, so this map only needs the site values we configure.
-_JOBSPY_LOGGER_DISPLAY = {
-    "linkedin": "LinkedIn",
-    "indeed": "Indeed",
-    "zip_recruiter": "ZipRecruiter",
-    "google": "Google",
-    "glassdoor": "Glassdoor",
-    "bayt": "Bayt",
-    "naukri": "Naukri",
-    "bdjobs": "BDJobs",
-}
-
-
-def _site_key(logger_name: str):
-    """"JobSpy:ZipRecruiter" -> "zip_recruiter". None for non-site loggers."""
-    name = str(logger_name or "")
-    if ":" not in name:
-        return None
-    suffix = name.split(":", 1)[1].strip()
-    if not suffix:
-        return None
-    flat = suffix.lower().replace("_", "").replace("-", "")
-    return _JOBSPY_SITE_KEYS.get(flat, suffix.lower())
+# A board that fails does not stop the others; jobspy (1.4+) names each failed board and its
+# error in `jobs_df.attrs["errors"]`, keyed by the same site values we pass in `site_name`.
 
 
 def _condense_error(msg: str) -> str:
@@ -101,38 +80,38 @@ def _condense_error(msg: str) -> str:
 # change helps. Each signature maps to a stable text. Every other failure keeps
 # its condensed text, so a failure nobody diagnosed stays visible as it is.
 # The frontend flags the same two boards in frontend/src/sourceBlocks.js.
+ZIP_RECRUITER_REDIRECTED = "the US site redirects this location to a regional ZipRecruiter site, which this scraper does not read: HTTP 307"
 ZIP_RECRUITER_BLOCKED = "the server refuses the requests that this scraper sends: HTTP 403"
 # The capture sees the log line, not the page. A real page with zero jobs logs the
-# same warning, so the Google text names the likely cause, not a certain one.
+# same error, so the Google text names the likely cause, not a certain one.
 GOOGLE_BLOCKED = "the server returned no job data, which is usually a JavaScript check page that this scraper cannot read"
 _KNOWN_BLOCKS = {
-    # jobspy/ziprecruiter/__init__.py logs the 403 body at ERROR. "forbidden aa"
-    # comes from the server, "forbidden cf-waf" from Cloudflare in front of it.
-    "zip_recruiter": (re.compile(r"forbidden (aa|cf-waf)", re.I), ZIP_RECRUITER_BLOCKED),
-    # jobspy/google/__init__.py logs this at WARNING when page 1 has no cursor.
-    "google": (re.compile(r"initial cursor not found", re.I), GOOGLE_BLOCKED),
+    # jobspy/ziprecruiter/__init__.py logs only "response status code <n>" at ERROR,
+    # without the body. From an EU address the US site answers 307 to its .de site.
+    "zip_recruiter": [
+        (re.compile(r"response status code 307\b", re.I), ZIP_RECRUITER_REDIRECTED),
+        (re.compile(r"response status code 403\b", re.I), ZIP_RECRUITER_BLOCKED),
+    ],
+    # jobspy/google/__init__.py fails with this when page 1 has neither jobs nor a cursor
+    # ("no job data returned" since 1.4, "returned no job data" before).
+    "google": [(re.compile(r"returned no job data|no job data returned", re.I), GOOGLE_BLOCKED)],
 }
 
 
 def _describe_error(key: str, msg: str) -> str:
     """The stable text for a known block signature of this board, else _condense_error(msg)."""
-    signature, text = _KNOWN_BLOCKS.get(key, (None, None))
-    if signature and signature.search(str(msg)):
-        return text
+    for signature, text in _KNOWN_BLOCKS.get(key, ()):
+        if signature.search(str(msg)):
+            return text
     return _condense_error(msg)
 
 
 def _board_errors(errors: dict, jobs_df, sources) -> dict:
-    """The captured errors to report for one scrape_jobs() call.
+    """The board errors to report for one scrape_jobs() call: only the boards this run asked for.
 
-    The capture handler sees every JobSpy logger in the process, so a run that
-    overlaps another run also receives that run's records. Only the boards this
-    run asked for are kept. Cross-talk on a board that both runs use stays.
-
-    jobspy logs the Google cursor warning also when page 1 held up to 10 jobs
-    (jobspy/google/__init__.py). A Google board that returned rows was not
-    blocked, so it gets no error. A different Google failure, for example on
-    page 2, keeps its text.
+    A Google board that returned rows was not blocked, so a "no job data" error
+    on it is dropped (cross-talk from another run, or a later page). A different
+    Google failure keeps its text.
     """
     returned = set()
     if jobs_df is not None and not jobs_df.empty and "site" in jobs_df.columns:
@@ -141,62 +120,39 @@ def _board_errors(errors: dict, jobs_df, sources) -> dict:
             if k in sources and not (k == "google" and v == GOOGLE_BLOCKED and k in returned)}
 
 
-# The Indeed scraper reports an HTTP failure through log.info, not log.warning
-# (jobspy/indeed/__init__.py: "responded with status code: <code>"), so a
-# WARNING threshold never saw an Indeed failure. The threshold is INFO now, and
-# this pattern — not the level — decides what an INFO record has to say to count
-# as a failure, so ordinary progress lines ("finished scraping") stay out of
-# source_breakdown.
-_INFO_FAILURE_RE = re.compile(r"responded with status code:\s*\d+", re.IGNORECASE)
+def _errors_of(jobs_df) -> dict:
+    """{board: text} for each board that failed in one scrape_jobs() call."""
+    raw = (getattr(jobs_df, "attrs", None) or {}).get("errors") or {}
+    return {str(site).lower(): _describe_error(str(site).lower(), msg) for site, msg in raw.items()}
 
 
-class _SourceLogCapture(logging.Handler):
-    """Keeps the first failure record each JobSpy board logger emits."""
+def jobspy_kwargs(search, proxy_url: str = None) -> dict:
+    """The scrape_jobs() arguments for one keyword search (the scheduled run and Test share them).
 
-    def __init__(self):
-        super().__init__(level=logging.INFO)
-        self.errors = {}
-
-    def emit(self, record):
-        try:
-            if not str(record.name).startswith("JobSpy"):
-                return
-            message = record.getMessage()
-            if record.levelno < logging.WARNING and not _INFO_FAILURE_RE.search(message):
-                return
-            key = _site_key(record.name)
-            if not key or key in self.errors:
-                return
-            self.errors[key] = _describe_error(key, message)
-        except Exception:  # a logging handler must never break the scrape
-            pass
-
-
-def _capture_targets(sites=None):
-    """Every logger the capture handler must attach to for one scrape_jobs() call; jobspy's create_logger() sets propagate=False, so a handler on the root logger alone would miss board records."""
-    names = set()
-    for raw in list(logging.Logger.manager.loggerDict):
-        if str(raw).startswith("JobSpy"):
-            names.add(str(raw))
-    for site in (sites or []):
-        display = _JOBSPY_LOGGER_DISPLAY.get(str(site).lower())
-        if display:
-            names.add(f"JobSpy:{display}")
-    return [logging.getLogger()] + [logging.getLogger(n) for n in sorted(names)]
-
-
-@contextmanager
-def _capture_source_errors(sites=None):
-    """Attach the capture handler to every JobSpy board logger for one call, without touching level/propagate since that would leak into other requests sharing the process."""
-    handler = _SourceLogCapture()
-    targets = _capture_targets(sites)
-    for lg in targets:
-        lg.addHandler(handler)
-    try:
-        yield handler
-    finally:
-        for lg in targets:
-            lg.removeHandler(handler)
+    jobspy 1.4 rejects a country it does not know with a ValueError for the whole call; a
+    search saved with a country it has since dropped says so instead of searching the US.
+    """
+    from backend.countries import normalize_country
+    sources = [s for s in (search.sources or []) if s != "direct"]
+    country = normalize_country(search.country or DEFAULT_COUNTRY)
+    if country is None:
+        raise ValueError(f"Indeed has no site for the country {search.country!r} any more; "
+                         f"pick another country for this search")
+    kwargs = {
+        "site_name": sources,
+        "search_term": search.search_term or "",
+        "location": compose_location(search.location, search.country),
+        "results_wanted": search.results_wanted or 50,
+        "hours_old": search.hours_old or 24,
+        "job_type": search.job_type or "fulltime",
+        "country_indeed": country,
+        "verbose": 2,
+    }
+    if search.is_remote is not None:
+        kwargs["is_remote"] = search.is_remote
+    if proxy_url:
+        kwargs["proxies"] = [proxy_url]
+    return kwargs
 
 
 def _merge_source_errors(breakdown: dict, errors: dict) -> dict:
@@ -226,10 +182,81 @@ def _count_returned(breakdown: dict, jobs_df) -> dict:
     return breakdown
 
 
+# Boards whose `is_remote` reads the board's own remote tag (python-jobspy 1.4.1): Indeed's
+# remote attribute unless it is also tagged hybrid, Glassdoor's remoteWorkTypes, ZipRecruiter's
+# locationTypes. LinkedIn and Google still guess it from the title, location or text, which
+# marked "remote state" (Terraform) remote, so theirs stays unused.
+_TAGGED_REMOTE_BOARDS = frozenset({"indeed", "glassdoor", "zip_recruiter"})
+
+
+def _structured_arrangement(row, site: str):
+    """What the board itself says about the work arrangement, for apply_arrangement_to_job.
+
+    Naukri's `work_from_home_type` names it; a tagged board's `is_remote` True means remote.
+    False only means "not tagged remote", so it is no answer (None) and the JD cascade decides.
+    """
+    wfh = _clean(row.get("work_from_home_type"))
+    if wfh:
+        return wfh
+    if site in _TAGGED_REMOTE_BOARDS and str(row.get("is_remote")) == "True":
+        return True
+    return None
+
+
+def _employer_link(row, url: str, loop):
+    """The employer's own posting for a JobSpy row (`job_url_direct`: Indeed, ZipRecruiter,
+    Naukri and BDJobs fill it when the job is not hosted on the board), or None.
+
+    A short link (grnh.se) is followed first, on the run's event loop; a link that names
+    no known employer system is kept only when it leaves the board's own site.
+    """
+    from urllib.parse import urlparse
+    direct = _clean(row.get("job_url_direct"))
+    if not direct or not direct.startswith(("http://", "https://")):
+        return None
+    if is_short_link(direct):
+        try:
+            direct = loop.run_until_complete(resolve_short_link(direct))
+        except Exception as e:
+            logger.debug(f"Short link {direct} not resolved: {e}")
+    link = employer_link(direct)
+    if link:
+        return link
+    board = (urlparse(url).hostname or "").removeprefix("www.")
+    host = (urlparse(direct).hostname or "").removeprefix("www.")
+    return direct if host and host != board and not host.endswith("." + board) else None
+
+
+def _fill_linkedin_descriptions(jobs_df, existing_ids, loop) -> int:
+    """JobSpy's LinkedIn rows carry no description (its per-job fetch is off): new ones get it
+    from LinkedIn's public job page (no account), paced, before they are stored. Writes into
+    jobs_df; returns how many were filled."""
+    from backend.scraper._shared.employer_text import missing_descriptions
+    if jobs_df is None or jobs_df.empty or "site" not in jobs_df.columns:
+        return 0
+    todo = []
+    for idx, row in jobs_df.iterrows():
+        url = _clean(row.get("job_url")) or ""
+        if str(row.get("site", "")).lower() != "linkedin" or _clean(row.get("description")) or not url:
+            continue
+        if make_external_id(_clean(row.get("company")) or "", _clean(row.get("title")) or "", url) in existing_ids:
+            continue
+        todo.append({"idx": idx, "url": url, "description": None})
+    if not todo:
+        return 0
+    filled = loop.run_until_complete(missing_descriptions(todo))
+    if "description" not in jobs_df.columns:
+        jobs_df["description"] = None
+    jobs_df["description"] = jobs_df["description"].astype(object)
+    for t in todo:
+        if t["description"]:
+            jobs_df.at[t["idx"], "description"] = t["description"]
+    return filled
+
+
 def get_setting_value(db: Session, key: str, default: str = "") -> str:
     """Read a single Setting row's value by key, returning ``default`` if not set."""
-    row = db.query(Setting).filter(Setting.key == key).first()
-    return row.value if row else default
+    return get_setting(db, key, default)
 
 
 def apply_title_filters(jobs_df, include_keywords: list, exclude_keywords: list):
@@ -242,8 +269,8 @@ def apply_title_filters(jobs_df, include_keywords: list, exclude_keywords: list)
     mask = pd.Series(True, index=jobs_df.index)
 
     if include_keywords:
-        pattern = "|".join(include_keywords)
-        mask &= jobs_df["title"].str.contains(pattern, case=False, na=False)
+        pattern = "|".join(include_pattern(kw) for kw in include_keywords)
+        mask &= jobs_df["title"].str.contains(pattern, case=False, na=False, regex=True)
 
     if exclude_keywords:
         pattern = "|".join(r'\b' + re.escape(kw) + r'\b' for kw in exclude_keywords)
@@ -260,8 +287,40 @@ def apply_company_filter(jobs_df, company_filter: list):
     return jobs_df[jobs_df["company"].str.lower().isin(cf_set)]
 
 
-def _run_sync(search, proxy_url: str = None) -> dict:
-    """Execute a single JobSpy search and return results dict."""
+def trim_postings(jobs_df, results_wanted: int, hours_old: int,
+                  fetched_results: int, fetched_hours: int):
+    """Cut a shared fetch (MT-8, made at the largest results_wanted / hours_old among the
+    subscribers) down to one account's own values.
+
+    - hours_old: rows whose `date_posted` is older than the account's window are dropped.
+      JobSpy dates are day-granular, so the cut is too (a row posted on the cutoff day is
+      kept); a row without a date is kept, as JobSpy itself would have returned it.
+    - results_wanted: JobSpy's limit is per board, so the first N rows of each board are
+      kept, in the order the boards returned them.
+    Nothing is touched when the account's values equal the fetched ones."""
+    import pandas as pd
+    from datetime import timedelta
+    if jobs_df is None or jobs_df.empty:
+        return jobs_df
+    if hours_old and fetched_hours and hours_old < fetched_hours and "date_posted" in jobs_df.columns:
+        cutoff = pd.Timestamp((datetime.now(timezone.utc) - timedelta(hours=hours_old)).date())
+        posted = pd.to_datetime(jobs_df["date_posted"], errors="coerce")
+        jobs_df = jobs_df[posted.isna() | (posted >= cutoff)]
+    if results_wanted and fetched_results and results_wanted < fetched_results and not jobs_df.empty:
+        if "site" in jobs_df.columns:
+            jobs_df = jobs_df.groupby("site", sort=False, group_keys=False).head(results_wanted)
+        else:
+            jobs_df = jobs_df.head(results_wanted)
+    return jobs_df
+
+
+def _run_sync(search, proxy_url: str = None, shared=None) -> dict:
+    """Execute a single JobSpy search and return results dict.
+
+    `shared` (a `backend.scraper.targets.SharedFetch`, MT-8): searches of several accounts
+    with the same target key share one `scrape_jobs()` call made at the largest
+    results_wanted / hours_old; this search then trims its copy to its own values and runs
+    its own filters, dedup and checks under the current account."""
     start_time = time.time()
     # One entry per configured board so a failure is visible next to boards that worked;
     # seeded here (not after the call) so failure paths can still say what was asked for.
@@ -277,27 +336,26 @@ def _run_sync(search, proxy_url: str = None) -> dict:
                     "error": "No JobSpy sources configured", "source_breakdown": {}}
         breakdown = {s: {"seen": 0, "new": 0} for s in sources}
 
-        kwargs = {
-            "site_name": sources,
-            "search_term": search.search_term or "",
-            "location": compose_location(search.location, search.country),
-            "results_wanted": search.results_wanted or 50,
-            "hours_old": search.hours_old or 24,
-            "job_type": search.job_type or "fulltime",
-            "country_indeed": search.country or DEFAULT_COUNTRY,
-            "verbose": 2,
-        }
+        kwargs = jobspy_kwargs(search, proxy_url)
 
-        if search.is_remote is not None:
-            kwargs["is_remote"] = search.is_remote
-
-        if proxy_url:
-            kwargs["proxies"] = [proxy_url]
-
-        logger.info(f"Running JobSpy search: {search.name} — term='{search.search_term}', sources={sources}")
-        with _capture_source_errors(sources) as capture:
+        if shared is None:
+            logger.info(f"Running JobSpy search: {search.name} — term='{search.search_term}', sources={sources}")
             jobs_df = scrape_jobs(**kwargs)
-        _merge_source_errors(breakdown, _board_errors(capture.errors, jobs_df, sources))
+            captured = _errors_of(jobs_df)
+        else:
+            own_results, own_hours = kwargs["results_wanted"], kwargs["hours_old"]
+            kwargs["results_wanted"] = shared.params.get("results_wanted") or own_results
+            kwargs["hours_old"] = shared.params.get("hours_old") or own_hours
+
+            def _fetch():
+                logger.info(f"Running shared JobSpy search: {search.name} — term='{search.search_term}', "
+                            f"sources={sources}, results={kwargs['results_wanted']}, hours={kwargs['hours_old']}")
+                df = scrape_jobs(**kwargs)
+                return df, _errors_of(df)
+            jobs_df, captured = shared.get_sync(_fetch)
+            jobs_df = trim_postings(jobs_df, own_results, own_hours,
+                                    kwargs["results_wanted"], kwargs["hours_old"])
+        _merge_source_errors(breakdown, _board_errors(captured, jobs_df, sources))
         # Rows each board returned, counted here — before the title filter, the
         # company allow-list and the company exclude. It is the only truthful
         # answer to "did this board deliver anything at all?": `seen` counts what
@@ -372,6 +430,28 @@ def _run_sync(search, proxy_url: str = None) -> dict:
             company_lookup = build_company_lookup(db)
             phrases = load_exclusion_phrases(db)
 
+            # The loop below writes rows; H-1B lookups for the new jobs happen before it (S2-01).
+            # Non-fatal like `_apply_h1b_inline`: without it the jobs keep what the cache has.
+            from backend.scraper._shared.analysis import prefetch_h1b
+            _new_companies = [
+                _clean(r.get("company")) for _, r in jobs_df.iterrows()
+                if make_external_id(_clean(r.get("company")) or "", _clean(r.get("title")) or "",
+                                    _clean(r.get("job_url")) or "") not in existing_ids
+            ]
+            _prefetch = prefetch_h1b(_new_companies)
+            try:
+                h1b_loop.run_until_complete(_prefetch)
+            except Exception as e:
+                _prefetch.close()
+                logger.warning(f"JobSpy H-1B prefetch skipped for '{search.name}': {e}")
+
+            try:
+                _filled = _fill_linkedin_descriptions(jobs_df, existing_ids, h1b_loop)
+                if _filled:
+                    logger.info(f"JobSpy: LinkedIn description for {_filled} new jobs in '{search.name}'")
+            except Exception as e:  # the jobs are stored without one, as before
+                logger.warning(f"JobSpy LinkedIn descriptions skipped for '{search.name}': {e}")
+
             for _, row in jobs_df.iterrows():
                 company = _clean(row.get("company")) or ""
                 title = _clean(row.get("title")) or ""
@@ -382,6 +462,7 @@ def _run_sync(search, proxy_url: str = None) -> dict:
                     continue
 
                 content_hash = make_content_hash(company, title)
+                apply_url = _employer_link(row, url, h1b_loop)
 
                 site = str(row.get("site", "")).lower()
                 source_map = {
@@ -398,26 +479,26 @@ def _run_sync(search, proxy_url: str = None) -> dict:
                     company=company,
                     title=title,
                     url=url,
+                    apply_url=apply_url,
                     source=source,
                     search_id=search.id,
                     description=_clean(row.get("description")),
                     location=_clean(row.get("location")),
-                    # JobSpy's own `is_remote` is a substring test over the whole
-                    # description, so "remote state" (Terraform) and "remote dev
-                    # environments" mark a job remote. It is deliberately unused.
-                    # `work_from_home_type` below is no help either: in
-                    # python-jobspy 1.1.82 only the Naukri scraper sets that field.
-                    # Indeed, LinkedIn, ZipRecruiter and Google rows always carry
-                    # None there, so the arrangement comes from the JD cascade.
+                    # Set below from the board's own remote tag where it has one
+                    # (_structured_arrangement), else from the JD cascade.
                     remote=None,
                     status="new",
                     seen=False,
                     saved=False,
                 )
 
-                # Extract salary if present in JobSpy results
+                # Extract salary if present in JobSpy results. Only a yearly amount (or one
+                # with no interval) is stored; hourly/daily/weekly/monthly pay is not a yearly
+                # figure, and a "yearly" one under 1000 is not a salary.
                 min_amount = row.get("min_amount")
                 max_amount = row.get("max_amount")
+                if not _jobspy_yearly(row.get("interval"), min_amount, max_amount):
+                    min_amount = max_amount = None
                 if min_amount and str(min_amount) != "nan":
                     try:
                         job.salary_min = int(float(min_amount))
@@ -437,11 +518,8 @@ def _run_sync(search, proxy_url: str = None) -> dict:
                     from backend.analyzer.salary_extractor import apply_salary_to_job
                     from backend.analyzer.work_arrangement import apply_arrangement_to_job
                     from backend.analyzer.location import apply_location_to_job
-                    company_obj = company_lookup.get(company.strip().lower())
                     apply_salary_to_job(job, getattr(job, "_h1b_median", None))
-                    wfh = row.get("work_from_home_type")
-                    apply_arrangement_to_job(
-                        job, structured=wfh if wfh and str(wfh) != "nan" else None)
+                    apply_arrangement_to_job(job, structured=_structured_arrangement(row, site))
                     apply_location_to_job(job)
                 except Exception as analysis_err:
                     logger.warning(f"Inline salary analysis failed for {title}: {analysis_err}")
@@ -455,8 +533,9 @@ def _run_sync(search, proxy_url: str = None) -> dict:
                     with db.begin_nested():
                         db.add(job)
                         db.flush()
-                    new_jobs += 1
-                    breakdown.setdefault(site or "unknown", {"seen": 0, "new": 0})["new"] += 1
+                    if counts_as_new(job):
+                        new_jobs += 1
+                        breakdown.setdefault(site or "unknown", {"seen": 0, "new": 0})["new"] += 1
                     existing_ids.add(ext_id)
                 except IntegrityError:
                     logger.debug(f"Duplicate external_id for '{title}' at {company}, skipping")
@@ -544,6 +623,9 @@ def _run_sync(search, proxy_url: str = None) -> dict:
                 "duration": duration, "source_breakdown": breakdown}
 
 
-async def run(search, proxy_url: str = None) -> dict:
-    """Async entry point — offloads the synchronous JobSpy call to a thread."""
-    return await asyncio.to_thread(_run_sync, search, proxy_url)
+async def run(search, proxy_url: str = None, shared=None) -> dict:
+    """Async entry point — offloads the synchronous JobSpy call to a thread (the account
+    context travels with it: to_thread copies the contextvars)."""
+    if shared is None:
+        return await asyncio.to_thread(_run_sync, search, proxy_url)
+    return await asyncio.to_thread(_run_sync, search, proxy_url, shared)

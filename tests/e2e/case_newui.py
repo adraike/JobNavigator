@@ -1,36 +1,35 @@
-"""newui — the 2.0 upgrade announcements (App.jsx / v2/NewUiModal.jsx /
-classic/WhatsNewBanner.jsx).
+"""newui — the 2.0 upgrade announcement (App.jsx / NewUiModal.jsx) and the
+old /classic bookmarks.
 
-Three facts, all keyed off localStorage, all checked in throwaway contexts so the
+Facts, all keyed off localStorage, all checked in throwaway contexts so the
 user's own storage is never involved:
 
   1. An EXISTING user (a profile carrying `jobnavigator_welcomed`, or any legacy
      key) sees "Welcome to the new JobNavigator" once. Closing it — by Escape,
      the scrim, the ✕ or "Got it", all one `onClose` — writes
-     `jobnavigator_newui_seen = '2.0.0'` and the next load is clean.
-  2. A GENUINELY FRESH profile sees the first-run tour instead — and the upgrade
-     modal is NOT marked seen, so it is still owed on the visit after the tour.
-  3. The two announcements never overlap: the modal is gated to the 2.0 shell
-     (and spends nothing on a /classic visit), while the classic shell's banner
-     announces 2.0 at /classic, dismisses to
-     `jobnavigator_whatsnew_dismissed = '2.0.0'`, and never shows in the 2.0 shell.
+     `jobnavigator_newui_seen = '3.1'` and the next load is clean.
+  2. A GENUINELY FRESH profile sees the first-run tour instead; the upgrade modal
+     is not marked seen while the tour is up, and closing the tour marks it seen
+     (V-01), so the visit after the tour is clean.
+  3. The classic dashboard was removed in 3.0: `/classic` and `/classic/<screen>`
+     redirect to the same path without the prefix (query and hash kept), so old
+     bookmarks land on the screen of the same name.
 
 `run.sh` copies this file into the backend container and runs it there; the
 frontend it drives is whatever the last `docker compose build frontend` produced,
 so the orchestrator must BUILD the frontend before this case means anything.
 """
+import re
+
 from _suite import case
 import _common as C
 import h
 
 NEWUI_TITLE = 'Welcome to the new JobNavigator'
 TOUR_TITLE = 'Welcome to JobNavigator'
-BANNER_HEAD = 'JobNavigator 2.0 — the new dashboard is here'
-BANNER_LINE = 'Rebuilt interface, five themes, Persona import, cron helper and more.'
-
 SEEN_KEY = 'jobnavigator_newui_seen'
-DISMISS_KEY = 'jobnavigator_whatsnew_dismissed'
-VERSION = '2.0.0'
+TELEMETRY_TITLE = 'Allow anonymous telemetry?'   # TelemetryChoice.jsx, asked of the owner once
+VERSION = '3.1'
 
 # The tour's own title is a PREFIX of the upgrade modal's, so "is the tour up?"
 # can never be asked with a plain substring test — it is true either way.
@@ -55,11 +54,11 @@ def _newui(c):
             if shown:
                 bullets = pg.evaluate("""() => {
                   const t = (document.querySelector('[role="dialog"]')?.innerText || '');
-                  return [/Everything you know, rebuilt/, /extension, redesigned/, /Pick a look in Settings/,
-                          /Persona import from a r/, /classic dashboard is still at \\/classic/]
+                  return [/up to five people share one install/, /Everything you know, rebuilt/,
+                          /extension, redesigned/, /Pick a look in Settings/, /Persona import from a r/]
                          .filter((re) => re.test(t)).length;
                 }""")
-                c.check('all five bullets render', bullets == 5, bullets)
+                c.check('all five bullets render, accounts first', bullets == 5, bullets)
                 notes = pg.evaluate(
                     """() => { const a = [...document.querySelectorAll('[role="dialog"] a')]
                         .find((x) => /Read the release notes/.test(x.textContent || ''));
@@ -115,76 +114,76 @@ def _newui(c):
             pg.wait_for_timeout(450)
             c.eq('dismissing the tour writes jobnavigator_welcomed',
                  C.ls_get(pg, 'jobnavigator_welcomed'), '1')
+            # V-01: a first-run tour marks the upgrade announcement seen too
+            c.eq('dismissing the first-run tour marks the upgrade seen',
+                 C.ls_get(pg, SEEN_KEY), VERSION)
 
-            # the visit AFTER the tour: no longer new, still unannounced
+            # the visit AFTER the tour: a brand-new user is never "upgraded"
             C.clear_log(pg)
             C.go(pg, '/feed', settle=900)
-            c.check('the upgrade modal is owed on the next visit', C.body_has(pg, NEWUI_TITLE))
+            c.check('no upgrade modal on the next visit', not C.body_has(pg, NEWUI_TITLE))
+            c.check('and no tour either', not _tour_only(pg))
         finally:
             pg.context.close()
 
-        # ── 2b. the modal never reaches the classic shell ───────────────────
-        # An existing profile that is OWED the announcement (no seen-mark) but
-        # lands under /classic gets the banner, not the modal — and the visit
-        # must not spend the announcement, so the mark stays unwritten and the
-        # modal is still there on the next visit to the 2.0 shell.
-        pg = C.raw_page(b, ls={'jobnavigator_welcomed': '1'})
-        try:
-            C.go(pg, '/classic', settle=900)
-            c.check('no new-UI modal in the classic shell', not C.body_has(pg, NEWUI_TITLE))
-            c.check('the classic shell shows the banner instead', C.body_has(pg, BANNER_HEAD))
-            c.check('a classic visit does not mark it seen',
-                    C.ls_get(pg, SEEN_KEY) is None, C.ls_get(pg, SEEN_KEY))
-            c.check('no dialog is mounted over the classic shell at all',
-                    pg.locator('[role="dialog"]').count() == 0)
+        # ── 2b. the owner's telemetry question comes right after either overlay ──
+        # GET /api/telemetry is answered "not asked yet" and the Save's PATCH /api/settings is
+        # answered in the browser, so the install's real choice is never read or written.
+        ask = {'level': 'unset', 'asked': False, 'owner': True, 'locked': False}
+        for label, seed, close in (
+                ('after the upgrade notice', {'jobnavigator_welcomed': '1'}, NEWUI_TITLE),
+                ('after the first-run tour', {}, TOUR_TITLE)):
+            pg = C.raw_page(b, ls=seed, telemetry=ask)
+            try:
+                C.go(pg, '/feed', settle=1200)
+                c.check(f'telemetry waits {label}', C.body_has(pg, close) and not C.body_has(pg, TELEMETRY_TITLE))
+                pg.keyboard.press('Escape')
+                pg.wait_for_timeout(1200)
+                c.check(f'telemetry is asked {label}', C.body_has(pg, TELEMETRY_TITLE))
+                c.check('Yes is preselected', pg.get_by_role('radio', name=re.compile('^Yes')).first
+                        .get_attribute('aria-checked') == 'true')
+                c.check('what is sent starts collapsed', not C.body_has(pg, 'Which screens are opened'))
+                pg.get_by_label('What is sent?').first.click()
+                c.check('Yes lists screens and actions', C.body_has(pg, 'Which screens are opened'))
+                pg.keyboard.press('Escape')
+                pg.mouse.click(5, 5)
+                pg.wait_for_timeout(450)
+                c.check('Escape and a click outside keep it open', C.body_has(pg, TELEMETRY_TITLE))
+                pg.get_by_role('radio', name=re.compile('^Essentials')).first.click()
+                c.check('Essentials lists health only', not C.body_has(pg, 'Which screens are opened')
+                        and C.body_has(pg, 'How often scrapes and AI calls succeed'))
+                saved = []
 
-            C.go(pg, '/feed', settle=900)
-            c.check('the same profile still gets it in the 2.0 shell', C.body_has(pg, NEWUI_TITLE))
-        finally:
-            pg.context.close()
+                def _patch(route, _request=None, saved=saved):
+                    if route.request.method == 'PATCH':
+                        saved.append(route.request.post_data_json)
+                        route.fulfill(json={'updated': ['telemetry_level']})
+                    else:
+                        route.continue_()
+                pg.route('**/api/settings', _patch)
+                pg.get_by_role('button', name='Save').first.click()
+                pg.wait_for_timeout(600)
+                c.eq('Save sends the pick (answered in the browser)', saved, [{'telemetry_level': 'essentials'}])
+                c.check('Save closes it', not C.body_has(pg, TELEMETRY_TITLE))
+            finally:
+                pg.context.close()
 
-        # ── 3. the classic banner ───────────────────────────────────────────
-        # newui_seen is pre-set here so the modal is out of the way and the
-        # banner is the only thing under test.
+        # ── 3. old /classic bookmarks ────────────────────────────────────────
+        # newui_seen is pre-set so the modal is out of the way. Every v1 path had
+        # a twin at the root, so the prefix is simply dropped.
         pg = C.raw_page(b, ls={'jobnavigator_welcomed': '1', SEEN_KEY: VERSION})
         try:
-            C.go(pg, '/classic', settle=900)
-            c.check('an undismissed profile sees the 2.0 banner at /classic',
-                    C.body_has(pg, BANNER_HEAD))
-            c.check('the banner carries the one-line summary', C.body_has(pg, BANNER_LINE))
-            link = pg.evaluate(
-                """() => { const a = [...document.querySelectorAll('main a')]
-                    .find((x) => /Open the new UI/.test(x.textContent || ''));
-                  return a ? { href: a.getAttribute('href'), target: a.getAttribute('target') } : null; }""")
-            c.check('"Open the new UI" targets / in the same tab',
-                    bool(link) and link['href'] == '/' and not link['target'], link)
-
-            # ClassicShell is the only mount point — the 2.0 shell never shows it
-            C.go(pg, '/feed', settle=900)
-            c.check('the banner does not appear in the 2.0 shell', not C.body_has(pg, BANNER_HEAD))
-
-            C.go(pg, '/classic', settle=900)
-            pg.get_by_text('Later', exact=True).first.click()
-            pg.wait_for_timeout(300)
-            c.check('"Later" dismisses it', not C.body_has(pg, BANNER_HEAD))
-            c.eq('dismissal is version-scoped', C.ls_get(pg, DISMISS_KEY), VERSION)
-
-            C.clear_log(pg)
-            C.go(pg, '/classic', settle=900)
-            c.check('a dismissed banner stays gone', not C.body_has(pg, BANNER_HEAD))
-            errs, perrs = C.console_errors(pg)
-            c.check('no console errors around the banner', not errs and not perrs,
-                    '; '.join((errs + perrs)[:2]))
-        finally:
-            pg.context.close()
-
-        # a profile that dismissed the 1.1.0 banner wrote a DIFFERENT key, so the
-        # 2.0 announcement is still owed to it
-        pg = C.raw_page(b, ls={'jobnavigator_welcomed': '1', SEEN_KEY: VERSION,
-                               'jn:whatsnew:v1.1.0': '1'})
-        try:
-            C.go(pg, '/classic', settle=900)
-            c.check('dismissing the 1.1.0 banner does not suppress the 2.0 one',
-                    C.body_has(pg, BANNER_HEAD))
+            for old, want in (('/classic', '/feed'),
+                              ('/classic/applications', '/applications'),
+                              ('/classic/settings?x=1#y', '/settings?x=1#y'),
+                              ('/classic/cover-letters', '/cover-letters')):
+                C.go(pg, old, settle=900)
+                got = pg.evaluate('() => location.pathname + location.search + location.hash')
+                # /feed opens its first job and appends ?job=<id> when the feed has rows;
+                # only the path matters for the redirect.
+                if want == '/feed':
+                    got = got.split('?', 1)[0]
+                c.eq(f'{old} lands on {want}', got, want)
+            c.check('no classic shell is left behind', pg.locator('aside.bg-slate-900').count() == 0)
         finally:
             pg.context.close()

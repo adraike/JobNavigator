@@ -5,7 +5,9 @@ import logging
 import re as _re
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import StreamingResponse
-from backend.models.db import SessionLocal, Setting, Persona
+from backend.accounts.owned import get_persona
+from backend.models.db import SessionLocal, Persona
+from backend.accounts.settings import get_setting
 from backend.analyzer.llm_client import call_autofill_llm, call_autofill_llm_stream
 from backend.analyzer.model_json import first_json_object
 from backend.analyzer.llm_logger import track_llm_call
@@ -251,8 +253,8 @@ def _flatten_qa_bank(bank) -> str:
 
 
 def _setting(db, key, default=""):
-    row = db.query(Setting).filter(Setting.key == key).first()
-    return row.value if row and row.value is not None else default
+    value = get_setting(db, key)
+    return value if value is not None else default
 
 
 def _json_setting(db, key, default):
@@ -267,7 +269,7 @@ def autofill_config():
     """Serve everything the extension needs to fill structured fields: the projected fixed answers, matching dictionaries, and the schema."""
     db = SessionLocal()
     try:
-        p = db.query(Persona).filter(Persona.id == 1).first()
+        p = get_persona(db, create=False)
         persona = {
             "contact": (p.contact if p else None) or {},
             "work_auth": (p.work_auth if p else None) or {},
@@ -306,13 +308,12 @@ def _build_autofill_prompt(body: dict, *, want_provider: bool = False) -> dict:
     provider = model = None
     db = SessionLocal()
     try:
-        persona = db.query(Persona).filter(Persona.id == 1).first()
-        len_row = db.query(Setting).filter(Setting.key == "autofill_default_length").first()
-        default_len = int(len_row.value) if len_row and (len_row.value or "").isdigit() else 120
-        tmpl_row = db.query(Setting).filter(Setting.key == "autofill_prompt").first()
-        if not tmpl_row or not (tmpl_row.value or "").strip():
+        persona = get_persona(db, create=False)
+        len_raw = get_setting(db, "autofill_default_length") or ""
+        default_len = int(len_raw) if len_raw.isdigit() else 120
+        template = get_setting(db, "autofill_prompt") or ""
+        if not template.strip():
             raise HTTPException(500, "autofill_prompt setting is empty")
-        template = tmpl_row.value
         persona_txt = _flatten_persona(persona) if persona else "(no persona)"
         qa_txt = _flatten_qa_bank(persona.qa_bank if persona else [])
 
@@ -400,9 +401,10 @@ async def autofill_answer_stream(body: dict):
     """SSE variant of /answer that streams the drafted answer as plain-text chunks (no JSON wrapper) so the extension can render it into the field live, sharing the persona/qa_bank cache prefix with /answer."""
     # Same editable `autofill_prompt` template as /answer, so what the user edits
     # in Settings governs the variant the extension actually streams (R4-T1-22).
-    built = _build_autofill_prompt(body)
+    built = _build_autofill_prompt(body, want_provider=True)
     cached_prefix = built["cached_prefix"]
     max_chars = built["max_chars"]
+    provider, model = built["provider"], built["model"]
 
     # Refinements: ordered change requests already applied ("shorter", "mention
     # fintech work"), appended to the suffix so the cache prefix stays untouched.
@@ -430,11 +432,14 @@ async def autofill_answer_stream(body: dict):
 
     async def _events():
         try:
-            raw_chunks = call_autofill_llm_stream(suffix, system, max_tokens=max_tokens,
-                                                  cached_prefix=cached_prefix)
-            async for chunk in _clean_stream(raw_chunks):
-                if chunk:
-                    yield f"data: {_json.dumps({'delta': chunk})}\n\n"
+            # R30 L-09: logged like /answer (duration, success, the pair). A stream carries no
+            # usage, so its tokens are logged as 0.
+            async with track_llm_call("autofill", provider, model):
+                raw_chunks = call_autofill_llm_stream(suffix, system, max_tokens=max_tokens,
+                                                      cached_prefix=cached_prefix)
+                async for chunk in _clean_stream(raw_chunks):
+                    if chunk:
+                        yield f"data: {_json.dumps({'delta': chunk})}\n\n"
             yield "data: [DONE]\n\n"
         except Exception as e:
             logger.error(f"autofill stream failed: {e}")

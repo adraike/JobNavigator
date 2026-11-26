@@ -5,8 +5,10 @@ from fastapi import APIRouter, Depends, HTTPException, Query, BackgroundTasks
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 from sqlalchemy import desc
-from backend.models.db import get_db, Application, Job, Company, Setting, utcnow, SessionLocal
+from backend.models.db import get_db, Application, Job, Company, utcnow, SessionLocal
+from backend.accounts.settings import get_setting, default_resume_ids
 from backend.scraper._shared.bot_wall import is_bot_wall
+from backend.scraper._shared.link_kinds import job_link
 
 logger = logging.getLogger("jobnavigator.applications")
 
@@ -116,10 +118,11 @@ def _extract_clean_content(raw_html: str) -> tuple:
 async def _fetch_with_playwright(url: str) -> str:
     """Fetch a page using Playwright for SPA/JS-rendered sites. Returns raw HTML."""
     from backend.scraper._shared.browser import _get_browser, _new_page, _close_page
-    from backend.scraper._shared.url_safety import assert_public_http_url
+    from backend.scraper._shared.url_safety import assert_public_http_url_async
     # Revalidate here too — this function is also reachable directly, and a
-    # single missed caller elsewhere would reopen the SSRF hole.
-    assert_public_http_url(url)
+    # single missed caller elsewhere would reopen the SSRF hole. Async wrapper:
+    # DNS must not block the event loop.
+    await assert_public_http_url_async(url)
     pw, browser = await _get_browser()
     try:
         page = await _new_page(browser)
@@ -163,7 +166,7 @@ async def _cache_job_page(job_id: str, url: str):
     is what took the container to 2.5 GB -- hence the `page_cache` gate.
     """
     from datetime import datetime, timezone
-    from backend.scraper._shared.url_safety import safe_get, assert_public_http_url, UnsafeURLError
+    from backend.scraper._shared.url_safety import safe_get, assert_public_http_url_async, UnsafeURLError
     from backend.job_monitor import get_limiter
 
     if not url:
@@ -179,7 +182,7 @@ async def _cache_job_page(job_id: str, url: str):
     # SSRF gate: user-submitted job URLs from the extension land here; without
     # it an attacker could cache http://169.254.169.254/ and read it via the UI.
     try:
-        assert_public_http_url(url)
+        await assert_public_http_url_async(url)
     except UnsafeURLError as e:
         logger.warning(f"Rejected unsafe job URL for {job_id}: {e}")
         _set_job_cache_error(job_id, f"unsafe URL: {e}")
@@ -369,11 +372,9 @@ def create_application(
         from backend.models.db import find_company_by_name
         existing_co = find_company_by_name(db, company_name)
         if not existing_co:
-            default_resume_row = db.query(Setting).filter(Setting.key == "default_resume_id").first()
-            default_resume_ids = [default_resume_row.value] if default_resume_row and default_resume_row.value else []
             new_co = Company(
                 name=company_name, tier=None, active=False, playwright_enabled=False,
-                selected_resume_ids=default_resume_ids,
+                selected_resume_ids=default_resume_ids(db),
             )
             db.add(new_co)
             db.flush()
@@ -428,10 +429,12 @@ def list_applications(
                   .filter(Resume.job_id.in_(job_ids), Resume.is_base == False)  # noqa: E712
                   .order_by(Resume.updated_at.asc()).all()):
             tailored[str(r.job_id)] = r      # asc → last write wins = most recent
+    from backend.analyzer.score_keys import resume_names
+    names = resume_names(db)
     return {
         "total": total,
         "applications": [_app_to_dict(a, lookup, tailored.get(str(a.job_id)),
-                                      str(a.job_id) in with_letter) for a in apps],
+                                      str(a.job_id) in with_letter, names=names) for a in apps],
     }
 
 
@@ -716,11 +719,11 @@ async def extract_posting(payload: ExtractRequest):
     import re
     from urllib.parse import urlparse
     from bs4 import BeautifulSoup
-    from backend.scraper._shared.url_safety import safe_get, assert_public_http_url, UnsafeURLError
+    from backend.scraper._shared.url_safety import safe_get, assert_public_http_url_async, UnsafeURLError
 
     url = (payload.url or "").strip()
     try:
-        assert_public_http_url(url)
+        await assert_public_http_url_async(url)
     except UnsafeURLError as e:
         raise HTTPException(status_code=400, detail=f"Unsafe URL: {e}")
 
@@ -853,8 +856,7 @@ def prep_bundle(app_id: str, db: Session = Depends(get_db)):
         return k(lo or hi) if (lo or hi) else None
 
     # Which optional sections to include (Settings -> Interview prep).
-    inc_row = db.query(Setting).filter(Setting.key == "prep_include").first()
-    inc = {x.strip() for x in ((inc_row.value if inc_row else None) or "resume,posting,notes").split(",") if x.strip()}
+    inc = {x.strip() for x in (get_setting(db, "prep_include") or "resume,posting,notes").split(",") if x.strip()}
 
     L = []
     add = L.append
@@ -873,8 +875,8 @@ def prep_bundle(app_id: str, db: Session = Depends(get_db)):
         sal = money(job.salary_min, job.salary_max)
         if sal:
             add("- Listed salary: " + sal)
-        if job.url:
-            add("- Posting: " + job.url)
+        if job_link(job):
+            add("- Posting: " + job_link(job))
     add("- Stage: " + (app.status or "applied").capitalize())
     if app.interviews:
         add("- Interviews booked:")
@@ -894,8 +896,12 @@ def prep_bundle(app_id: str, db: Session = Depends(get_db)):
         tailored = (db.query(Resume)
                     .filter(Resume.job_id == app.job_id, Resume.is_base == False)  # noqa: E712
                     .order_by(Resume.updated_at.desc()).first())
-    cv_name = (tailored.name if tailored else None) or app.cv_version_used or (job.best_cv if job else None)
+    from backend.analyzer.score_keys import display_best, is_resume_key
+    best_key = job.best_cv if job else None
+    cv_name = (tailored.name if tailored else None) or app.cv_version_used or display_best(job, db=db)
     src = tailored
+    if not src and not app.cv_version_used and is_resume_key(best_key):
+        src = db.query(Resume).filter(Resume.id == best_key).first()    # scores are keyed by résumé id
     if not src and cv_name:
         src = db.query(Resume).filter(Resume.name == cv_name).first()
     resume_text = ""
@@ -921,15 +927,22 @@ def prep_bundle(app_id: str, db: Session = Depends(get_db)):
         add(posting.strip() or "[no posting text was captured]")
 
     # ── 4. the ask — editable in Settings → AI ───────────────────────────────
-    ask = db.query(Setting).filter(Setting.key == "prep_ask").first()
+    ask = get_setting(db, "prep_ask") or ""
     add("")
     add("## What I need from you")
-    add((ask.value.strip() if ask and ask.value else "") or "Prepare me for this interview.")
+    add(ask.strip() or "Prepare me for this interview.")
     return {"text": "\n".join(L)}
 
 
-def _app_to_dict(a: Application, lookup=None, tailored=None, has_cover_letter=False) -> dict:
-    """Serialize an Application; pass lookup={lowercase: Company} (from build_company_lookup) to populate company_canonical for alias-aware grouping, else it falls back to the raw company name."""
+def _session_of(obj):
+    from sqlalchemy.orm import object_session
+    return object_session(obj)
+
+
+def _app_to_dict(a: Application, lookup=None, tailored=None, has_cover_letter=False,
+                 names: dict | None = None) -> dict:
+    """Serialize an Application; pass lookup={lowercase: Company} (from build_company_lookup) to populate company_canonical for alias-aware grouping, else it falls back to the raw company name. `names` ({résumé id: name}, score_keys.resume_names) is loaded once by a list caller."""
+    from backend.analyzer.score_keys import display_best
     job = a.job
     raw = job.company if job else None
     canonical_co = (lookup or {}).get((raw or "").lower())
@@ -949,8 +962,8 @@ def _app_to_dict(a: Application, lookup=None, tailored=None, has_cover_letter=Fa
         "company": raw,
         "company_canonical": canonical_co.name if canonical_co else raw,
         "title": job.title if job else None,
-        "url": job.url if job else None,
-        "best_cv": job.best_cv if job else None,
+        "url": job_link(job) if job else None,
+        "best_cv": display_best(job, names=names, db=_session_of(a)) if job else None,
         "short_id": job.short_id if job else None,
         # posting details the detail pane shows, so it never has to re-fetch the job
         "location": job.location if job else None,

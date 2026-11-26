@@ -3,6 +3,7 @@ import pytest
 from unittest.mock import AsyncMock, MagicMock
 
 from backend.analyzer import llm_client as L
+from backend.cli_runner import runtime as R
 from backend.analyzer.llm_client import NonRetryableLLMError, REASONING_HEADROOM
 from backend.models.db import Setting
 
@@ -176,15 +177,15 @@ async def test_openai_reasoning_that_fills_the_cap_is_not_retried(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_claude_code_passes_effort_flag(monkeypatch):
+async def test_claude_code_passes_effort_flag(test_db, monkeypatch):
     seen = {}
 
     async def fake_run_cli(cmd, stdin, env=None, timeout=None, cwd=None):
         seen["cmd"] = cmd
         return 0, b'{"result": "ok", "is_error": false, "subtype": "success"}', b""
 
-    monkeypatch.setattr(L, "_run_cli", fake_run_cli)
-    await L._call_claude_code("p", "s", "claude-opus-5-5", 100, effort="xhigh")
+    monkeypatch.setattr(R, "_run_cli", fake_run_cli)
+    await R._call_claude_code("p", "s", "claude-opus-5-5", 100, effort="xhigh")
     assert seen["cmd"][seen["cmd"].index("--effort") + 1] == "xhigh"
 
 
@@ -198,8 +199,8 @@ async def test_codex_passes_effort_as_a_toml_string(monkeypatch):
             return 0, b"", b""
         return 0, b'{"type": "item.completed", "item": {"type": "agent_message", "text": "ok"}}\n', b""
 
-    monkeypatch.setattr(L, "_run_cli", fake_run_cli)
-    await L._call_codex_cli("p", "s", "gpt-6-sol", 100, effort="high")
+    monkeypatch.setattr(R, "_run_cli", fake_run_cli)
+    await R._call_codex_cli("p", "s", "gpt-6-sol", 100, effort="high")
     cmd = seen["cmds"][-1]
     assert cmd[cmd.index("-c", cmd.index("--model")) + 1] == 'model_reasoning_effort="high"'
 

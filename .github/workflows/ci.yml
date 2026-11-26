@@ -15,11 +15,11 @@ permissions:
 jobs:
   lint-python:
     name: Lint Python
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v7
         with:
           python-version: "3.12"
       - name: Install ruff
@@ -32,11 +32,11 @@ jobs:
 
   test-python:
     name: Run pytest (backend)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v7
         with:
           python-version: "3.12"
           cache: "pip"
@@ -47,56 +47,86 @@ jobs:
         env:
           DATABASE_URL: "sqlite:///:memory:"
         run: |
-          pytest backend/tests/ \
-            --ignore=backend/tests/verify_caching_live.py \
-            --tb=short
+          pytest backend/tests/ --tb=short
+
+  test-frontend:
+    # R30 I-07: the Vitest specs and the style lint ran only on a developer's machine.
+    name: Frontend tests and style lint
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - name: Set up Node
+        uses: actions/setup-node@v7
+        with:
+          node-version: 24
+      - name: Install frontend deps
+        # No lockfile on purpose (tests/tools/fe-test.sh installs the same way), so the
+        # image build and the tests resolve the same ranges.
+        working-directory: frontend
+        run: npm install --no-audit --no-fund --no-package-lock
+      - name: Vitest
+        working-directory: frontend
+        env:
+          TZ: UTC
+          CI: "1"
+        run: npx vitest run
+      - name: Style lint (no raw colour, font, radius or shadow outside ui.jsx / theme.css)
+        run: python3 tests/tools/stylelint.py
 
   audit-deps:
     name: Dependency vulnerability scan
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     # Advisory only — don't block the build on CVEs in third-party deps that
     # we can't fix immediately. Rely on the GitHub Actions summary to flag them.
     continue-on-error: true
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v7
         with:
           python-version: "3.12"
           cache: "pip"
       - name: Install pip-audit
         run: pip install pip-audit
       - name: Scan backend/requirements.txt for known CVEs
-        # --ignore-vuln CVE-2025-46656 — markdownify 0.13.1 is pinned by
-        #   python-jobspy 1.1.82 (<0.14). The vulnerable code path is an
-        #   HTML→Markdown converter used inside jobspy on content we never
-        #   route untrusted input through. Re-evaluate when jobspy >1.1.82 ships.
-        run: |
-          pip-audit -r backend/requirements.txt --strict \
-            --ignore-vuln CVE-2025-46656
+        run: pip-audit -r backend/requirements.txt --strict
 
   build-docker:
     name: Build Docker images
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@v4
       - name: Create minimal .env
         run: cp .env.example .env
       - name: Build backend image
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: .
           file: Dockerfile.backend
           push: false
+          load: true
+          tags: jobnavigator-backend:local
           cache-from: type=gha
           cache-to: type=gha,mode=max
       - name: Build frontend image
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: .
           file: Dockerfile.frontend
           push: false
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+      - name: Build CLI runner images
+        run: |
+          docker buildx build --load -f Dockerfile.runner --target codex-runner -t jobnavigator-codex-runner:local .
+          docker buildx build --load -f Dockerfile.runner --target claude-runner -t jobnavigator-claude-runner:local .
+          docker buildx build --load -f Dockerfile.runner --target antigravity-runner -t jobnavigator-antigravity-runner:local .
+      - name: Check runner containers without subscription credentials
+        run: python3 tests/tools/runner_smoke.py
+      - name: Build runner manager
+        run: docker buildx build --load -f Dockerfile.runner-manager -t jobnavigator-runner-manager:local .
+      - name: Check automatic runner lifecycle and restart draining
+        run: python3 tests/tools/runner_management_smoke.py

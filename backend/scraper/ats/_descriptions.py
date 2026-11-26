@@ -35,10 +35,15 @@ def _resolve_branded_greenhouse_slug(host: str) -> str | None:
     host = host.lower()
     # Lazy import to avoid circular imports during module init.
     from backend.models.db import SessionLocal, Company
+    from backend.accounts.context import unscoped
     db = SessionLocal()
     try:
-        # Build {host: slug} from companies that have a Greenhouse scrape_url.
-        for c in db.query(Company).all():
+        # Build {host: slug} from companies that have a Greenhouse scrape_url. Host → slug is
+        # public board knowledge and the cache is process-wide, so it reads every account's
+        # companies (MT-8): the answer must not depend on which account asked first.
+        with unscoped():
+            companies = db.query(Company).all()
+        for c in companies:
             slug = None
             for u in (c.scrape_urls or []):
                 u_host = (urlparse(u).hostname or "").lower()
@@ -81,14 +86,15 @@ async def _fetch_job_description(url: str, job: dict = None) -> str | None:
     writes them onto it here, so no second request is made for them.
     """
     from backend.scraper._shared.url_safety import (
-        assert_public_http_url,
+        assert_public_http_url_async,
         safe_get,
         UnsafeURLError,
     )
 
     # SSRF gate — URLs end up here from scraped JD content and extension submits.
+    # Async wrapper: DNS must not block the event loop once per job.
     try:
-        assert_public_http_url(url)
+        await assert_public_http_url_async(url)
     except UnsafeURLError as e:
         logger.warning(f"Rejected unsafe JD URL {url!r}: {e}")
         return None
@@ -100,6 +106,11 @@ async def _fetch_job_description(url: str, job: dict = None) -> str | None:
             return desc
     except Exception as e:
         logger.debug(f"ATS description fetch failed for {url}: {e}")
+
+    # A levels.fyi job page's visible text is only a cookie banner and a landing blurb
+    from backend.scraper._shared.levels_jobs import is_levels_job
+    if is_levels_job(url):
+        return None
 
     # Generic HTML fallback
     try:
@@ -156,6 +167,14 @@ async def _fetch_description_ats(url: str, job: dict = None) -> str | None:
 
     parsed = urlparse(url)
 
+    # ── Levels.fyi job page: the text is in its page data, the visible page is a cookie banner ──
+    from backend.scraper._shared import levels_jobs
+    if levels_jobs.is_levels_job(url):
+        data = await levels_jobs.fetch_job(url)
+        if data and job is not None and data.get("application_url") and not job.get("application_url"):
+            job["application_url"] = data["application_url"]
+        return (data or {}).get("description")
+
     # ── Oracle HCM: /sites/{site}/job/{id} ──
     # Detail API: ById finder with quoted Id (%22 = ")
     if _oracle_hcm_host(url) and "/job/" in parsed.path:
@@ -211,7 +230,8 @@ async def _fetch_description_ats(url: str, job: dict = None) -> str | None:
             ext_path += "/" + part
         if company_slug and site and ext_path:
             api_url = f"{origin}/wday/cxs/{company_slug}/{site}{ext_path}"
-            async with httpx.AsyncClient(timeout=15, follow_redirects=True) as client:
+            from backend.scraper.ats import workday as _wd   # Cloudflare refuses httpx (see _client)
+            async with _wd._client(15) as client:
                 resp = await client.get(api_url, headers={"Accept": "application/json"})
                 if resp.status_code == 200:
                     data = json.loads(resp.text)
@@ -548,6 +568,19 @@ async def _fetch_description_ats(url: str, job: dict = None) -> str | None:
             if jid_vals and jid_vals[0].isdigit() and path_parts:
                 job_id = jid_vals[0]
                 company_slug = path_parts[0]
+        if not job_id and path_parts[-1:] == ["job_app"]:
+            # The embed link Jobright hands over: /embed/job_app?for=<board>&token=<id>. Without
+            # `for` it redirects to the same link with it. Its page starts with Greenhouse's
+            # header ("Job Application for … at …", "Back to jobs"), so the API is read instead.
+            query = parse_qs(parsed.query)
+            token = (query.get("token") or [""])[0]
+            if token.isdigit():
+                job_id = token
+                company_slug = (query.get("for") or [""])[0]
+                if not company_slug:
+                    from backend.scraper._shared.url_safety import safe_get
+                    landed = urlparse(str((await safe_get(url, timeout=15)).url))
+                    company_slug = (parse_qs(landed.query).get("for") or [""])[0]
         if company_slug and job_id:
             api_url = f"https://boards-api.greenhouse.io/v1/boards/{company_slug}/jobs/{job_id}"
             async with httpx.AsyncClient(timeout=15, follow_redirects=True) as client:
@@ -571,6 +604,8 @@ async def _fetch_descriptions_parallel(jobs_to_fetch, max_concurrent=5):
     sem = asyncio.Semaphore(max_concurrent)
 
     async def fetch_one(job_dict):
+        if job_dict.get("description"):   # the board's own API sent it (Uber): no page request
+            return job_dict, job_dict["description"]
         async with sem:
             desc = await _fetch_job_description(job_dict["url"], job=job_dict)
             return job_dict, desc

@@ -4,26 +4,98 @@ import asyncio
 import json
 import logging
 import os
+from collections.abc import MutableMapping
 
 from backend.models.db import (
     SessionLocal, Job,
     build_company_lookup, get_existing_external_ids,
 )
 from backend.scraper._shared.dedup import make_external_id, make_content_hash
+from backend.scraper._shared.postings import is_short_link, resolve_short_link
 from backend.analyzer.salary_extractor import apply_salary_to_job
 from backend.analyzer.work_arrangement import apply_arrangement_to_job
 from backend.analyzer.location import apply_location_to_job
 from backend.analyzer.h1b_checker import check_job_h1b, determine_h1b_verdict
+from backend.scraper._shared.filters import include_hit
 
 logger = logging.getLogger("jobnavigator.jobs")
 
-# In-memory LinkedIn import progress tracker (shared with routes_jobs for the
-# progress-polling endpoint). Import this from routes_jobs via the module path.
-_linkedin_import_progress: dict = {}
+class _PerAccountProgress(MutableMapping):
+    """In-memory LinkedIn import progress, one dict per account (QA F5, R5-02).
+
+    Reads and writes go to the entry of the account in the current context (the import
+    task runs under the account that started it), so two accounts' imports never wipe or
+    mix each other's counters and each polls only its own."""
+
+    def __init__(self):
+        self._by_account: dict = {}
+
+    @staticmethod
+    def _key():
+        from backend.accounts.context import current_account
+        acc = current_account.get()
+        return str(acc) if acc is not None else ""
+
+    def _mine(self) -> dict:
+        return self._by_account.setdefault(self._key(), {})
+
+    def __getitem__(self, k):
+        return self._mine()[k]
+
+    def __setitem__(self, k, v):
+        self._mine()[k] = v
+
+    def __delitem__(self, k):
+        del self._mine()[k]
+
+    def __iter__(self):
+        return iter(dict(self._by_account.get(self._key(), {})))
+
+    def __len__(self):
+        return len(self._by_account.get(self._key(), {}))
+
+    def __repr__(self):
+        return repr(self._by_account.get(self._key(), {}))
+
+    def forget(self, account_id) -> None:
+        """Drop a removed account's entry (QA F8 / R5-10)."""
+        self._by_account.pop(str(account_id), None)
+
+    def reset_all(self) -> None:
+        """Tests: forget every account's progress."""
+        self._by_account.clear()
+
+
+# Shared with routes_jobs for the progress-polling endpoint.
+_linkedin_import_progress = _PerAccountProgress()
 
 # Persisted (mounted) Playwright session cookies — written by
 # backend/refresh_linkedin_session.py. Survives container restarts.
-_SESSION_PATH = "/root/.linkedin_api/li_cookies.json"
+def _session_path() -> str:
+    """The jar the LinkedIn import reads: the mock account's session when a mock account is set
+    (Settings › LinkedIn), else the main account's. MT-16: the current account's jars (the
+    owner's mock jar is /root/.linkedin_api/li_cookies.json, a member's lives under accounts/<id>/)."""
+    from backend.accounts.credentials import linkedin_extension_cookies, linkedin_personal_cookies
+    from backend.accounts.settings import get_setting
+    from backend.models.db import SessionLocal
+    db = SessionLocal()
+    try:
+        mock = (get_setting(db, "linkedin_mock_email") or "").strip()
+    finally:
+        db.close()
+    if mock:
+        return linkedin_extension_cookies()
+    main, old = linkedin_personal_cookies(), linkedin_extension_cookies()
+    # Before the sessions split, an install without a mock account kept its personal session in
+    # the extension jar: it carries over as the main session once.
+    if not os.path.exists(main) and os.path.exists(old) and not os.path.exists(old + ".account"):
+        try:
+            import shutil
+            os.makedirs(os.path.dirname(main) or ".", exist_ok=True)
+            shutil.copyfile(old, main)
+        except OSError:
+            return old
+    return main
 
 # The exact Voyager endpoint + decoration the linkedin-api library used; returns plain JSON
 # with top-level title/companyDetails/description/formattedLocation/applyMethod.
@@ -46,6 +118,9 @@ _VOYAGER_JOB_JS = """async (jid) => {
     for (const v of Object.values(d.applyMethod || {})) {
         if (v && v.companyApplyUrl) { apply = v.companyApplyUrl; break; }
     }
+    // "OffsiteApply" (the employer's site) or "...OnsiteApply" (Easy Apply), from the key's tail
+    const applyKey = Object.keys(d.applyMethod || {})[0] || '';
+    const applyType = applyKey.split('.').pop();
     // workplaceTypes is a URN list ("urn:li:fs_workplaceType:2"); workRemoteAllowed
     // is a plain bool. Both are read defensively: this decoration is not
     // documented, so a build that omits them just yields nulls.
@@ -57,6 +132,8 @@ _VOYAGER_JOB_JS = """async (jid) => {
             location: d.formattedLocation || '',
             description: (d.description && d.description.text) || '',
             apply_url: apply || '',
+            apply_type: applyType,
+            job_state: d.jobState || '',
             workplace_type: wpt,
             work_remote_allowed: (typeof d.workRemoteAllowed === 'boolean')
                 ? d.workRemoteAllowed : null};
@@ -77,7 +154,7 @@ def _voyager_arrangement(job_data: dict) -> str | None:
 def _load_session_cookies():
     """Load persisted Playwright cookies, or None if the session file is absent."""
     try:
-        with open(_SESSION_PATH) as f:
+        with open(_session_path()) as f:
             cookies = json.load(f)
         return cookies or None
     except (OSError, ValueError):
@@ -135,10 +212,10 @@ async def enrich(linkedin_ids: list[str], db=None):
         session_cookies = _load_session_cookies()
         if not session_cookies:
             logger.error("LinkedIn import: no session cookies at %s — run "
-                         "`python -m backend.refresh_linkedin_session` first", _SESSION_PATH)
+                         "Settings › LinkedIn › Sign in (or `python -m backend.refresh_linkedin_session --session main|mock`) first", _session_path())
             _linkedin_import_progress["status"] = "error"
             _linkedin_import_progress["error_details"] = [{"stage": "session",
-                "error": "no LinkedIn session — run refresh_linkedin_session"}]
+                "error": "no LinkedIn session — refresh it in Settings › LinkedIn"}]
             return
 
         existing_ext_ids = get_existing_external_ids(db)
@@ -174,10 +251,10 @@ async def enrich(linkedin_ids: list[str], db=None):
                     "}")
                 if me_status != 200:
                     logger.error("LinkedIn import: session invalid (me=%s) — run "
-                                 "`python -m backend.refresh_linkedin_session`", me_status)
+                                 "Settings › LinkedIn › Sign in (or `python -m backend.refresh_linkedin_session --session main|mock`)", me_status)
                     _linkedin_import_progress["status"] = "error"
                     _linkedin_import_progress["error_details"] = [{"stage": "session",
-                        "error": f"session invalid (me={me_status}) — run refresh_linkedin_session"}]
+                        "error": f"session invalid (me={me_status}) — refresh it in Settings › LinkedIn"}]
                     return
 
             for lid in pre_dedup:
@@ -201,7 +278,7 @@ async def enrich(linkedin_ids: list[str], db=None):
                     if ext_search:
                         title_lower = title.lower()
                         include_kw = ext_search.title_include_keywords or []
-                        if include_kw and not any(kw.lower() in title_lower for kw in include_kw):
+                        if include_kw and not any(include_hit(kw, title_lower) for kw in include_kw):
                             logger.info(f"LinkedIn {lid}: title '{title}' doesn't match include filter, skipping")
                             skipped += 1
                             continue
@@ -238,12 +315,14 @@ async def enrich(linkedin_ids: list[str], db=None):
                         skipped += 1
                         continue
 
+                    landed = await resolve_short_link(job_url) if is_short_link(job_url) else job_url
                     job = Job(
                         external_id=ext_id,
                         content_hash=c_hash,
                         company=company,
                         title=title,
                         url=job_url,
+                        apply_url=landed if landed != job_url else None,
                         source="linkedin_extension",
                         linkedin_job_id=lid,
                         search_id=ext_search.id if ext_search else None,

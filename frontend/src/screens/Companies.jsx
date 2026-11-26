@@ -1,9 +1,11 @@
 import React, { useState, useEffect, useMemo, useRef, useCallback } from 'react'
 import { useNavigate } from 'react-router-dom'
 import api from '../api'
+import { track } from '../telemetry'
 import { useToasts, ToastStack } from '../Toast'
 // shared dialog also serves résumé and cover-letter deletes, so it lives in its own file.
 import ConfirmDialog from '../ConfirmDialog'
+import CopyFrom from '../CopyFrom'
 import { useSettled, useWarm, NBSP, DASH } from '../hooks'
 import { Button, DashedAdd, Dot, Drawer as UiDrawer, FlaskGlyph, FooterRow, HeaderRow, Heading, Helper, IconButton, Input, Label, Link, Menu, MenuItem, ModalPanel, Mono, Notice, PageTitle, Pill, Row, Rule, SearchInput, Segmented, ShowMore, Spinner, TableHead, TableRow, Tag } from '../ui'
 import '../theme.css'
@@ -26,14 +28,20 @@ const warnTextOf = (c, downReason) => c.last_error || downReason
   || (c.last_run_warning ? `last run found nothing · ${ago(c.last_scraped_at)}` : null)
 const warnMuted = (c) => !c.active || !!c.warning_acknowledged
 const isAlarming = (c, downReason) => !!warnTextOf(c, downReason) && !warnMuted(c)
-// FastAPI's `detail` is a plain string for HTTPException; append it when present.
-const errSuffix = (e) => (typeof e?.response?.data?.detail === 'string' ? ' — ' + e.response.data.detail : '')
+// FastAPI's `detail` is a plain string for HTTPException; append it when present. Coded
+// errors ({detail: 'name_taken', message}) carry their sentence in `message`.
+const errSuffix = (e) => {
+  const d = e?.response?.data
+  if (typeof d?.message === 'string' && d.message) return ' — ' + d.message
+  return typeof d?.detail === 'string' ? ' — ' + d.detail : ''
+}
 
 // ATS + tier chip colors live in theme.css (.cc-*) so they flip with dark mode.
-const ATS_SLUGS = new Set(['greenhouse', 'workday', 'lever', 'ashby', 'phenom', 'oraclehcm', 'smartrecruiters', 'rippling', 'eightfold', 'talentbrew', 'meta', 'google'])
+const ATS_SLUGS = new Set(['greenhouse', 'workday', 'lever', 'ashby', 'phenom', 'oraclehcm', 'smartrecruiters', 'rippling', 'amazon', 'eightfold', 'talentbrew', 'meta', 'google', 'uber'])
 const atsShort = (detected) => (detected || 'Generic')
   .replace(' API', '').replace(' AJAX', '').replace(' (Playwright)', '').replace(' Careers', '')
 const atsSlug = (short) => { const s = (short || 'generic').toLowerCase().replace(/[^a-z0-9]/g, ''); return 'cc-' + (ATS_SLUGS.has(s) ? s : 'generic') }
+const atsId = (short) => (short || 'generic').toLowerCase().replace(/[^a-z0-9]/g, '')   // telemetry: 'Oracle HCM' -> 'oraclehcm'
 const tierSlug = (key) => 'cc-tier' + (key === 'none' ? 'none' : key)
 // Company.tier is stored as an integer 1/2/3 (nullable) — backend/models/db.py.
 // The UI shows priority tiers as letters; tierLabel(1) -> 'A', tierLabel(1, { long: true }) -> 'Tier A'.
@@ -69,6 +77,11 @@ const detectAts = (url) => {
   if (hostMatches(url, 'greenhouse.io')) return 'Greenhouse'
   if (hostMatches(url, 'ats.rippling.com') || (hostMatches(url, 'rippling.com') && pathHas(url, '/careers'))) return 'Rippling'
   if (hostMatches(url, 'jobs.smartrecruiters.com', 'careers.smartrecruiters.com', 'api.smartrecruiters.com')) return 'SmartRecruiters'
+  // amazon.is_amazon: an amazon.jobs host with /search in the path
+  if (hostMatches(url, 'amazon.jobs') && pathHas(url, '/search')) return 'Amazon'
+  // uber.is_uber: jobs.uber.com's job search, or the old uber.com careers list (not one posting)
+  if (hostMatches(url, 'jobs.uber.com') && /^\/([a-z]{2}(-[a-z]{2})?\/)?jobs\/?$/i.test(new URL(url).pathname)) return 'Uber'
+  if (hostMatches(url, 'uber.com') && pathHas(url, '/careers/list') && !/\/careers\/list\/\d+/.test(new URL(url).pathname)) return 'Uber'
   if (hostMatches(url, 'metacareers.com')) return 'Meta'
   if (url.toLowerCase().includes('google.com/about/careers')) return 'Google'
   return 'Generic'
@@ -165,7 +178,7 @@ export default function Companies() {
 
   // only company_scrape runs belong on this screen; /monitor/active also carries scoring/search runs
   // keyed by job/search id. Prefer company_id when present; scope_key is the fallback for older runs.
-  const runMap = (data) => { const m = {}; (data || []).forEach((r) => { if (r.job_type !== 'company_scrape') return; const id = r.company_id || r.scope_key; if (id) m[id] = true }); return m }
+  const runMap = (data) => { const m = {}; (data || []).forEach((r) => { if (r.job_type !== 'company_scrape') return; const id = r.company_id || r.scope_key; if (id) m[id] = r.waiting ? 'waiting' : true }); return m }
   // health is refetched with the list, so a run that clears (or causes)
   // a failure updates the row ▲, the header count and the sort without a reload.
   const fetchHealth = useCallback(async () => {
@@ -297,8 +310,18 @@ export default function Companies() {
   const runScrape = async (id) => {
     if (scraping[id]) return
     setScraping((m) => ({ ...m, [id]: true }))
-    try { await api.post(`/scrape/company/${id}`) }
+    try {
+      await api.post(`/scrape/company/${id}`)
+      const c = companies.find((x) => x.id === id)
+      track('company_scraped', { ats: atsId(detectAts((c?.scrape_urls || [])[0])) })
+    }
     catch (e) {
+      // The scheduled scrape is running: nothing was started, so drop the spinner.
+      if (e.response?.data?.detail === 'scheduled_scrape_running') {
+        pushToast({ kind: 'error', msg: 'The scheduled scrape is running — try again when it finishes' })
+        setScraping((m) => { const n = { ...m }; delete n[id]; return n })
+        return
+      }
       // 409 means the run is genuinely in flight — keep the spinner, the
       // /monitor/active poll clears it when the run finishes.
       if (e.response?.status === 409) { pushToast({ kind: 'progress', msg: 'That company is already being scraped' }); return }
@@ -336,7 +359,7 @@ export default function Companies() {
     return `${ids.length} selected`
   }
   const healthOf = (c) => {
-    if (scraping[c.id]) return { dot: 'var(--accent)', fg: 'var(--accent)', text: 'scraping now…' }
+    if (scraping[c.id]) return { dot: 'var(--accent)', fg: 'var(--accent)', text: scraping[c.id] === 'waiting' ? 'waiting for another scrape…' : 'scraping now…' }
     const warn = warnTextOf(c, downMap[c.id])
     // paused or acknowledged: keep the verdict, drop the alarm colours
     if (warn && warnMuted(c)) return { dot: 'var(--edge)', fg: 'var(--muted)',
@@ -396,6 +419,11 @@ export default function Companies() {
           <span style={{ fontSize: 13, lineHeight: '20px', color: 'var(--muted)', ...warmStyle }}>{countLine}</span>
         </div>
         <div style={{ marginLeft: 'auto', display: 'flex', alignItems: 'center', gap: 10 }}>
+          <CopyFrom kind="companies" pushToast={pushToast} onCloned={async (row) => {
+            await fetchCompanies()
+            window.dispatchEvent(new CustomEvent('jn:counts-changed'))
+            openDrawer(row)
+          }} />
           <Button onClick={() => setAddOpen(true)}>+ Add company</Button>
         </div>
       </HeaderRow>
@@ -517,11 +545,11 @@ export default function Companies() {
                   raise the cell itself while its menu is open: 28 clears the sticky head (3)/rows, stays under drawer (29/30). */}
               <span className="v2-cactions" style={{ flex: '0 0 190px', display: 'flex', alignSelf: 'stretch', alignItems: 'center', justifyContent: 'flex-end', gap: 4, position: 'sticky', right: 0, paddingLeft: 8, zIndex: menuId === c.id ? 28 : undefined }} onClick={(e) => e.stopPropagation()}>
                 <Pill size="xs" line="inherit" disabled={testBusy} onClick={() => runScrape(c.id)}
-                  title={testBusy ? 'A test is already running' : 'Scrape this company now'}>
+                  title={testBusy ? 'A test is already running' : scraping[c.id] === 'waiting' ? 'Queued: another scrape is running, this one starts when it finishes' : 'Scrape this company now'}>
                   {scraping[c.id]
                     ? <Spinner />
                     : <span style={{ fontSize: 11 }}>↻</span>}
-                  {scraping[c.id] ? 'Running' : 'Run'}
+                  {scraping[c.id] === 'waiting' ? 'Waiting' : scraping[c.id] ? 'Running' : 'Run'}
                 </Pill>
                 {/* the running test names itself; every other pill goes quiet, so the running one keeps full opacity while un-clickable */}
                 <Pill size="xs" line="inherit" on={testingId === c.id} disabled={testBusy} onClick={() => runTest(c.id)}
@@ -803,9 +831,10 @@ function AddModal({ onClose, resumes, personaPopulated, onCreated, pushToast }) 
         tier, scrape_interval_minutes: interval === '' ? null : parseInt(interval) || null,
         selected_resume_ids: selected, auto_scoring_depth: depth,
       })
+      track('company_added', { ats: atsId(ats) })
       onCreated(); onClose()
     } catch (e) {
-      pushToast({ kind: 'error', msg: 'Could not add company' + (typeof e?.response?.data?.detail === 'string' ? ' — ' + e.response.data.detail : '') })
+      pushToast({ kind: 'error', msg: 'Could not add company' + errSuffix(e) })
       setSaving(false)
     }
   }
@@ -898,7 +927,7 @@ function TestModal({ test, onClose, showShots, setShowShots }) {
     + (bodyExcluded ? ` · ${bodyExcluded} would be ignored (body phrases)` : '')
     + ` · ${rejected} invalid`
     + (passCo != null && passCo !== kept ? ` · ${passCo} pass this company's filters · ${Math.max(0, passCo - kept - bodyExcluded)} removed by the global exclude list` : '')
-    + (bodyUnchecked ? ` · ${bodyUnchecked} not body-checked (needs the description)` : '')
+    + (bodyUnchecked ? ` · ${bodyUnchecked} with the posting body text check skipped` : '')
   const urls = test.urls_scraped || []
   const pag = test.pagination_debug || []
   const shots = test.screenshots || []
@@ -909,7 +938,7 @@ function TestModal({ test, onClose, showShots, setShowShots }) {
     if (j.kept) return {
       tag: 'Kept', tagBg: 'var(--accent-soft)', tagFg: 'var(--good)', reasonFg: 'var(--muted)',
       // a kept row the body scan couldn't run on is not a promise — say so
-      reason: j.reason || (bodyPhrases > 0 && j.body_checked === false ? 'body check needs the description' : ''),
+      reason: j.reason || (bodyPhrases > 0 && j.body_checked === false ? 'posting body text check was skipped' : ''),
     }
     if (j.reason?.startsWith('[Global]')) return { tag: 'Global', tagBg: 'var(--warn-soft)', tagFg: 'var(--warn)', reasonFg: 'var(--warn)', reason: j.reason.replace('[Global] ', '') }   // the global exclude list, not this company's filters
     return { tag: 'Out', tagBg: 'var(--bad-soft)', tagFg: 'var(--bad)', reasonFg: 'var(--bad)', reason: j.reason || '' }

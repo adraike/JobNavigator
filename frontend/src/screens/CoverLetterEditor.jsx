@@ -1,7 +1,11 @@
 import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react'
+import ClosedMark from '../ClosedMark'
 import { useParams, useNavigate } from 'react-router-dom'
 import { useToasts, ToastStack } from '../Toast'
 import api from '../api'
+import { track, voiceId } from '../telemetry'
+import { downloadErrorReason, downloadName } from '../download'
+import { useFlushBeforeSwitch } from '../accounts'
 import { Picker, VoicePicker, LengthPicker, LENGTHS, STAGE_CLASS } from './CoverLetters'
 import ConfirmDialog from '../ConfirmDialog'
 // the undo-removal helper and the band rule are shared with the résumé editors
@@ -9,6 +13,7 @@ import { useUndoRemove, BandRule } from './ResumeSections'
 import { Button, Card as UiCard, DashedAdd, FooterRow, Heading, HeaderRow, Helper, IconButton, Input, Label, Link, Menu, MenuItem, ModalPanel, MoveArrows, NavLink, RemoveX, SectionHead, Spinner, Surface, ToolbarTrigger } from '../ui'
 import '../theme.css'
 import { useTitle } from '../useTitle'
+import { loadDemo } from '../demoHooks'
 import { fetchRunOutcome, runFailed, runFailureReason, useSettled, useSingleOpen, NBSP } from '../hooks'
 
 const EMPTY = {
@@ -131,13 +136,17 @@ export default function CoverLetterEditor() {
     if (!loaded.current) return
     pendingPatch.current = { ...pendingPatch.current, ...patch }
     clearTimeout(saveTimer.current)
-    saveTimer.current = setTimeout(async () => {
-      const body = pendingPatch.current
-      pendingPatch.current = {}
-      try { await api.patch(`/cover-letters/${id}`, body); setSavedAt(new Date().toISOString()); setSaveErr('') }
-      catch (e) { console.error(e); setSaveErr('Could not save — your last edit is not stored.'); pushToast({ kind: 'error', msg: 'Could not save — your last edit is not stored.' }) }
-    }, 500)
-  }, [id])
+    saveTimer.current = setTimeout(sendPending, 500)
+  }, [id])  // eslint-disable-line react-hooks/exhaustive-deps
+  async function sendPending() {
+    const body = pendingPatch.current
+    pendingPatch.current = {}
+    if (!Object.keys(body).length) return
+    try { await api.patch(`/cover-letters/${id}`, body); setSavedAt(new Date().toISOString()); setSaveErr('') }
+    catch (e) { console.error(e); setSaveErr('Could not save — your last edit is not stored.'); pushToast({ kind: 'error', msg: 'Could not save — your last edit is not stored.' }) }
+  }
+  // QA F7 / R6-01: a switch sends the merged patch the timer still owes first
+  useFlushBeforeSwitch(() => { clearTimeout(saveTimer.current); return sendPending() })
 
   const update = (mutator) => {
     setData((prev) => {
@@ -160,7 +169,7 @@ export default function CoverLetterEditor() {
     pdfTimer.current = setTimeout(async () => {
       try {
         const r = await api.get(`/cover-letters/${id}/pdf`, { responseType: 'arraybuffer', signal: ac.signal })
-        const url = URL.createObjectURL(new Blob([r.data], { type: 'application/pdf' }))
+        const url = URL.createObjectURL(new Blob([r.data], { type: __DEMO__ ? 'text/html' : 'application/pdf' }))
         if (prevBlob.current) URL.revokeObjectURL(prevBlob.current)
         prevBlob.current = url
         setPdfUrl(url)
@@ -179,15 +188,24 @@ export default function CoverLetterEditor() {
   // whenever a dashboard key is set — go through axios and save the blob.
   const download = async () => {
     try {
+      // the edit the debounced save still owes goes first, so the PDF has it (R30 D-06)
+      clearTimeout(saveTimer.current); await sendPending()
       const r = await api.get(`/cover-letters/${id}/pdf`, { responseType: 'blob' })
-      const cd = r.headers['content-disposition'] || ''
-      const m = /filename="?([^"]+)"?/.exec(cd)
+      track('letter_exported', { format: 'pdf' })
+      if (__DEMO__) {   // the demo prints the rendered template through the browser
+        const { printHtml, blobText } = await loadDemo('pdf.js')
+        await printHtml(await blobText(r.data)); return
+      }
       const url = URL.createObjectURL(r.data)
       const a = document.createElement('a')
-      a.href = url; a.download = m ? m[1] : 'CoverLetter.pdf'
+      a.href = url; a.download = downloadName(r.headers?.['content-disposition'], 'CoverLetter.pdf')
       document.body.appendChild(a); a.click(); a.remove()
       setTimeout(() => URL.revokeObjectURL(url), 1000)
-    } catch (e) { console.error(e); pushToast({ kind: 'error', msg: 'Could not download the PDF.' }) }   // a download failure is not a save failure
+    } catch (e) {   // a download failure is not a save failure
+      console.error(e)
+      const reason = await downloadErrorReason(e)
+      pushToast({ kind: 'error', msg: 'Could not download the PDF' + (reason ? ` — ${reason}` : '.') })
+    }
   }
 
   const remove = () => {
@@ -226,6 +244,7 @@ export default function CoverLetterEditor() {
         resume_id: rSource, job_id: doc.job_id, voice: rVoice, length: rLength,
         cover_letter_id: id,       // rewrite this draft in place
       })
+      track('letter_generated', { voice: voiceId(rVoice) })
       regenRun.current = started?.run_id || null   // read its status below
     } catch (e) {
       setRegening(false)
@@ -363,6 +382,7 @@ export default function CoverLetterEditor() {
         <div style={{ flex: 1, minWidth: 0, display: 'flex', flexDirection: 'column', gap: 1 }}>
           <span style={{ minWidth: 0, fontSize: 12.5, lineHeight: '18px', fontWeight: 500, color: 'var(--text-2)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
             Written for <span style={{ color: 'var(--text)' }}>{doc.company ? `${doc.company} — ${doc.title}` : doc.name}</span>
+            {doc.job_id && <ClosedMark jobId={doc.job_id} />}
             {doc.source_name && <><BandRule />from <span onClick={() => doc.resume_id && navigate(`/resumes/${doc.resume_id}`)}
               title={doc.resume_id ? 'Open the source résumé' : 'Written from your Persona'}
               style={{ color: 'var(--accent)', cursor: doc.resume_id ? 'pointer' : 'default' }}>{doc.source_name}{doc.resume_id ? ' ↗' : ''}</span></>}

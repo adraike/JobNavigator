@@ -1,14 +1,26 @@
 import React, { useState, useEffect, useMemo, useCallback, useRef } from 'react'
 import { useNavigate } from 'react-router-dom'
 import api from '../api'
+import { track } from '../telemetry'
+import { useFlushBeforeSwitch } from '../accounts'
 import { useToasts, ToastStack } from '../Toast'
 import ConfirmDialog from '../ConfirmDialog'
 import { useEscape, useSettled, NBSP, DASH } from '../hooks'
 import { Button, Card, Check, CopyGlyph, DashedAdd, Dot, FooterRow, GlyphBadge, Heading, HeaderRow, Helper, IconButton, Input, Label, Link, Menu, MenuItem, ModalPanel, Mono, PageTitle, Pill, Row, SectionHead, Segmented, Spinner, Textarea } from '../ui'
 import { PICK_KEY, clickMods, clickSelection, pruneSelection } from './rowSelect'
+import { useApifyBoards, apifySourceLabel } from '../apifyBoards'
 import '../theme.css'
 
 // ── helpers ──────────────────────────────────────────────────────────────────
+// Demo build: a plain /api link would load the SPA, so fetch the snapshot and open it as a page.
+async function openDemoSnapshot(jobId) {
+  const w = window.open('', '_blank')
+  try {
+    const { data } = await api.get(`/jobs/${jobId}/cached-page`, { responseType: 'text', transformResponse: (r) => r })
+    if (w) w.location.href = URL.createObjectURL(new Blob([data], { type: 'text/html' }))
+  } catch { if (w) w.close() }
+}
+
 const ts = (iso) => (iso ? new Date(iso).getTime() : 0)
 const daysSince = (iso) => (iso ? Math.max(0, Math.floor((Date.now() - new Date(iso).getTime()) / 86400000)) : 0)
 const ago = (iso) => {
@@ -32,10 +44,12 @@ const fmtSalary = (lo, hi) => {
   return lo || hi ? k(lo || hi) : ''
 }
 
-const srcLabel = (v) => ({
+// `boards` (useApifyBoards) names the `apify_<board>` sources.
+const srcLabel = (v, boards = []) => apifySourceLabel(boards, v, ' via Apify') || ({
   direct: 'a company scrape', manual: 'the Log application form', jobright: 'Jobright.ai', levels_fyi: 'Levels.fyi',
   linkedin_personal: 'LinkedIn Personal', linkedin_extension: 'the LinkedIn extension',
-  extension: 'the extension', freehire: 'freehire.me',
+  extension: 'the extension', freehire: 'freehire.me', caribbeanjobs: 'caribbeanjobs.com', trulyremote: 'trulyremotework.com',
+  behance: 'Behance', hollylist: 'hollylist.com', wanacreate: 'wanacreate.art', himalayas: 'himalayas.app', eluta: 'eluta.ca', dribbble: 'Dribbble', artstation: 'ArtStation', workwithindies: 'workwithindies.com',
 }[v] || (v ? v.replace(/^jobspy_/, '').replace(/_/g, ' ') : 'the Job Feed'))
 
 // Dots read the shared --stage-* tokens (theme.css), not generic --warn/--good/--bad,
@@ -47,7 +61,7 @@ const STAGES = [
   { id: 'rejected', label: 'Rejected', dot: 'var(--stage-rejected)', hint: 'Closed — kept in Stats' },
 ]
 const STAGE = Object.fromEntries(STAGES.map((s) => [s.id, s]))
-// legacy rows (ghosted / withdrawn) have no stage of their own — closed, so they list under Rejected
+// a status outside the four stages is closed, so it lists under Rejected
 const groupOf = (status) => (STAGE[status] ? status : 'rejected')
 // The Log modal writes one of two rows. `new`/`saved` are Job.status values and go to
 // POST /jobs/manual as a feed job with no application; the rest are Application.status
@@ -81,6 +95,7 @@ const errSuffix = (e) => (typeof e?.response?.data?.detail === 'string' ? ' — 
 // ── main ─────────────────────────────────────────────────────────────────────
 export default function Applications() {
   const navigate = useNavigate()
+  const apifyBoards = useApifyBoards()
   const [apps, setApps] = useState([])
   // null (not 0) until the first fetch lands, so the empty state doesn't flash before data arrives;
   // a failed fetch must not read as "you have no applications" either.
@@ -111,6 +126,7 @@ export default function Applications() {
   const [bulkBusy, setBulkBusy] = useState(false)   // one bulk write at a time
   const timers = useRef([])
   const notesTimer = useRef(null)
+  const notesPending = useRef(null)
   useEffect(() => () => { timers.current.forEach(clearTimeout); clearTimeout(notesTimer.current) }, [])
   // load() sequence guard: a slow full-list reload landing after a newer one must not
   // stomp the newer response. patchSeq is the same idea per-row, for `patch()` below.
@@ -240,9 +256,11 @@ export default function Applications() {
   // (e.g. two quick stage clicks on one application).
   const patch = async (id, body) => {
     const seq = (patchSeq.current[id] = (patchSeq.current[id] || 0) + 1)
+    const before = apps.find((a) => a.id === id)?.status
     setApps((p) => p.map((a) => (a.id === id ? { ...a, ...body } : a)))   // optimistic
     try {
       const { data } = await api.patch(`/applications/${id}`, body)
+      if (body.status && body.status !== before) track('status_changed', { from: before, to: body.status })
       if (patchSeq.current[id] !== seq) return   // a newer PATCH on this row is already in flight or has landed
       setApps((p) => p.map((a) => (a.id === id ? { ...a, ...data } : a)))   // merge the server's canonical row (status_transitions, updated_at, …)
     } catch (e) {
@@ -253,15 +271,25 @@ export default function Applications() {
   // autosave: debounce while typing, flush immediately on blur
   const saveNotes = useCallback((id, value, now) => {
     clearTimeout(notesTimer.current)
+    notesPending.current = null
     const run = () => {
+      notesPending.current = null
       const seq = (patchSeq.current[id] = (patchSeq.current[id] || 0) + 1)
       setApps((p) => p.map((a) => (a.id === id ? { ...a, notes: value } : a)))
       api.patch(`/applications/${id}`, { notes: value })
         .then(({ data }) => { if (patchSeq.current[id] === seq) setApps((p) => p.map((a) => (a.id === id ? { ...a, ...data } : a))) })   // the row's age follows the server's updated_at
         .catch((e) => { console.error(e); pushToast({ kind: 'error', msg: 'Could not save notes' + errSuffix(e) }) })
     }
-    if (now) run(); else notesTimer.current = setTimeout(run, 700)
+    if (now) run(); else { notesPending.current = run; notesTimer.current = setTimeout(run, 700) }
   }, [pushToast])
+  // QA F7 / R6-01: a switch writes the notes still waiting on the timer first
+  // (api.js then waits for that PATCH to answer before the cookie moves)
+  useFlushBeforeSwitch(() => {
+    const run = notesPending.current
+    if (!run) return
+    clearTimeout(notesTimer.current)
+    run()
+  })
 
   const remove = (a) => {
     setMenuOpen(false)
@@ -424,7 +452,7 @@ export default function Applications() {
     }))
     if (d.last_email_received) h.push({ what: 'Reply detected in Gmail', at: d.last_email_received, dot: 'var(--line-strong)' })
     if (d.applied_at) h.push({ what: `Applied with ${d.tailored_resume_name || d.cv_version_used || d.best_cv || 'unknown résumé'}`, at: d.applied_at, dot: 'var(--line-strong)' })
-    if (d.discovered_at) h.push({ what: `Discovered via ${srcLabel(d.source)}`, at: d.discovered_at, dot: 'var(--line-strong)' })
+    if (d.discovered_at) h.push({ what: `Discovered via ${srcLabel(d.source, apifyBoards)}`, at: d.discovered_at, dot: 'var(--line-strong)' })
     return h.sort((a, b) => new Date(b.at) - new Date(a.at))
   }, [d])
 
@@ -689,7 +717,8 @@ function Detail({ d, history, menuOpen, setMenuOpen, onStage, onNotes, onDelete,
                 --pill-on-* trio is exactly what the open state drew by
                 hand. Height is the one override (this header's 30, not sm's 33);
                 the padding is now sm's 15px rather than ACT_BTN's 14. */}
-            {d.has_cached_page && <Button variant="secondary" size="sm" href={`/api/jobs/${d.job_id}/cached-page`} target="_blank"
+            {d.has_cached_page && <Button variant="secondary" size="sm"
+              {...(__DEMO__ ? { onClick: () => openDemoSnapshot(d.job_id) } : { href: `/api/jobs/${d.job_id}/cached-page`, target: '_blank' })}
               title="Snapshot of the posting from application day" style={{ height: 30 }}>Cached</Button>}
             {d.url && <Button variant="secondary" size="sm" href={d.url} target="_blank"
               title="Open the live posting" style={{ height: 30 }}>Live ↗</Button>}
